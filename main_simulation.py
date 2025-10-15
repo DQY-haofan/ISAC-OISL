@@ -33,7 +33,7 @@ SPEED_OF_LIGHT = 299792458  # m/s
 def setup_ieee_style():
     """IEEE single-column style"""
     plt.rcParams.update({
-        'figure.figsize': (3.5, 2.8),
+        'figure.figsize': (8, 5),
         'figure.dpi': 300,
         'savefig.dpi': 300,
         'font.family': 'serif',
@@ -380,7 +380,7 @@ def generate_fig_capacity_vs_background(params, output_dir='./', verbose=False):
     print(f"✓ Range: [{np.min(capacity_values):.4f}, {np.max(capacity_values):.4f}] bits/slot")
 
     # Plot
-    fig, ax = plt.subplots(figsize=(3.5, 2.8))
+    fig, ax = plt.subplots(figsize=(8, 5))
 
     ax.semilogx(rb_array, capacity_values, 'b-', linewidth=2)
 
@@ -473,7 +473,7 @@ def generate_fig_fim_vs_resources(params, scenarios, output_dir='./', verbose=Fa
     log_mse[valid] = np.log10(mse_trace[valid])
 
     # Plot
-    fig, ax = plt.subplots(figsize=(3.5, 2.8))
+    fig, ax = plt.subplots(figsize=(8, 5))
 
     Alpha, Rho = np.meshgrid(alpha_range, rho_range)
 
@@ -616,7 +616,7 @@ def generate_fig_pareto_boundary(params, scenarios, output_dir='./', verbose=Fal
         print(f"  Found {len(pareto_points)} Pareto points")
 
     # Plot
-    fig, ax = plt.subplots(figsize=(3.5, 2.8))
+    fig, ax = plt.subplots(figsize=(8, 5))
 
     for scenario_name, scenario in scenarios.items():
         points = pareto_results[scenario_name]
