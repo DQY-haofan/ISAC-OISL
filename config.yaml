@@ -1,0 +1,225 @@
+# OISL-ISAC Section IV Configuration
+# IEEE Transactions Paper - Numerical Results Parameters
+# =======================================================
+
+# Physical Constants
+physical_constants:
+  speed_of_light: 299792458  # m/s
+  planck_constant: 6.626e-34  # J·s
+  wavelength: 1550e-9  # m (C-band)
+  photon_energy: 1.282e-19  # J
+
+# System Parameters (Main Simulation)
+system_parameters:
+  # Basic photon budget
+  Sbar: 10.0  # Average signal photons per slot
+  Smax: 100.0  # Peak signal photons per slot
+
+  # Timing
+  dt: 1.0e-6  # Slot duration [s]
+  N: 10000  # Total number of slots
+
+  # Detector properties
+  eta: 0.8  # Quantum efficiency
+  M_pixels: 16  # Parallel detector pixels
+  tau_d: 50.0e-9  # Dead time [s]
+
+  # Pointing parameters
+  theta_b: 10.0e-6  # Beam divergence half-angle [rad]
+  sigma2: 2.25e-12  # Pointing jitter variance [rad^2] (1.5 μrad)^2
+  mu: [0.0, 0.0]  # Mean pointing bias [rad]
+
+  # Link parameters
+  Llink: 1.0e-12  # Static link budget factor
+  hnu: 1.282e-19  # Photon energy [J]
+
+  # Prior information matrix (Bayesian CRLB)
+  J_P: [[1.0e-12, 0.0, 0.0, 0.0],
+        [0.0, 1.0e-12, 0.0, 0.0],
+        [0.0, 0.0, 1.0e-10, 0.0],
+        [0.0, 0.0, 0.0, 1.0e-4]]
+
+# Hardware Platform Configurations
+hardware_platforms:
+  short_deadtime:
+    dead_time: 5.0e-9  # 5 ns
+    parallel_pixels: 64
+    peak_power: 500.0
+    slot_duration: 1.0e-6
+    name: "Short τd (5ns, M=64)"
+
+  long_deadtime:
+    dead_time: 50.0e-9  # 50 ns
+    parallel_pixels: 16
+    peak_power: 500.0
+    slot_duration: 1.0e-6
+    name: "Long τd (50ns, M=16)"
+
+# Simulation Scenarios
+simulation:
+  # Signal budget sweep for Figure 1
+  signal_budgets: [0.5, 2.0, 10.0, 50.0]
+
+  # Background regimes (photons/slot)
+  background_regimes:
+    zodiacal:
+      lambda_b: 0.01
+      name: "Zodiacal Light"
+      color: "#0072BD"
+      description: "Deep space, ecliptic poles"
+
+    earthshine:
+      lambda_b: 1.0
+      name: "Earthshine"
+      color: "#EDB120"
+      description: "Earth-pointing, moderate albedo"
+
+    stray_light:
+      lambda_b: 10.0
+      name: "Stray Light"
+      color: "#A2142F"
+      description: "Near-sun operations"
+
+# Monte Carlo Validation Parameters
+monte_carlo:
+  n_trials: 1000  # Number of MC trials (reduce for faster testing)
+  confidence_level: 0.95
+
+  # Test scenarios for CRLB validation
+  test_scenarios:
+    - name: "Low Background"
+      Sbar: 10.0
+      r_b: 0.1
+      alpha: 0.3
+      rho: 0.5
+
+    - name: "Medium Background"
+      Sbar: 50.0
+      r_b: 1.0
+      alpha: 0.2
+      rho: 0.6
+
+    - name: "High Background"
+      Sbar: 20.0
+      r_b: 5.0
+      alpha: 0.4
+      rho: 0.7
+
+# Ergodic vs Outage Analysis
+channel_analysis:
+  # Background state distribution
+  background_distribution:
+    low:
+      lambda_b: 0.01
+      probability: 0.70
+    medium:
+      lambda_b: 1.0
+      probability: 0.25
+    high:
+      lambda_b: 10.0
+      probability: 0.05
+
+  outage_probability: 0.1  # 10% outage
+
+  # Signal budget range for analysis
+  signal_range:
+    min: 0.1
+    max: 100.0
+    num_points: 30
+
+# Design Law Parameters (Figure 4)
+design_law:
+  # Sun avoidance angle range [degrees]
+  sun_angle_range:
+    min: 10
+    max: 180
+    num_points: 50
+
+  # Field of view range [microradians]
+  fov_range:
+    min: 20
+    max: 500
+    num_points: 40
+
+  # Background model parameters
+  background_model:
+    pst_min: 1.0e-10  # Minimum point source transmittance
+    pst_max: 1.0e-4   # Maximum point source transmittance
+    reference_fov: 100.0e-6  # Reference FoV [rad]
+
+# Figure Generation Settings
+figures:
+  style: "ieee_single_column"
+  dpi: 300
+  format: ["pdf", "png"]
+
+  # Figure-specific parameters
+  fig1_capacity:
+    lambda_b_points: 80
+    background_range: [0.01, 100.0]
+
+  fig2_fim:
+    alpha_points: 25
+    rho_points: 25
+    alpha_range: [0.05, 0.95]
+    rho_range: [0.05, 0.95]
+
+  fig3_pareto:
+    alpha_points: 20
+    rho_points: 20
+    mse_targets: 15
+    probe_points: 8  # For adaptive MSE range detection
+
+  fig4_design:
+    capacity_contour_levels: [0.1, 0.5, 1.0, 2.0, 3.0, 4.0]
+
+# Validation and Testing
+validation:
+  # Parameter ranges for robustness testing
+  parameter_sweep:
+    dead_time: [5.0e-9, 20.0e-9, 50.0e-9, 100.0e-9]
+    parallel_pixels: [1, 4, 16, 64, 256]
+    beam_divergence: [5.0e-6, 10.0e-6, 20.0e-6]
+
+  # Convergence testing
+  convergence:
+    pilot_counts: [100, 500, 1000, 2000, 5000]
+    grid_resolutions: [10, 15, 20, 25, 30]
+
+# Output Organization
+output:
+  base_directory: "section_iv_results"
+  subdirectories:
+    figures: "figures"
+    data: "data"
+    validation: "validation"
+    appendix: "appendix"
+
+  # File naming convention
+  naming:
+    timestamp: true
+    parameter_suffix: true
+
+  # Data preservation
+  save_intermediate: true
+  compress_data: true
+
+# Computational Settings
+computation:
+  # Parallel processing (if available)
+  use_multiprocessing: false
+  num_processes: 4
+
+  # Memory management
+  chunk_size: 1000
+
+  # Numerical tolerances
+  tolerances:
+    fim_condition_number: 1.0e30
+    regularization: 1.0e-12
+    convergence: 1.0e-10
+
+  # Optimization settings
+  optimization:
+    max_iterations: 1000
+    grid_search_resolution: 100
