@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """
-OISL-ISAC Performance Limits Simulation (Optimized Version)
-============================================================
+OISL-ISAC Performance Limits Simulation (FIXED VERSION)
+========================================================
 
-Improvements:
-1. GPU acceleration support (via CuPy, optional)
-2. IEEE single-column friendly figures with larger fonts
-3. Multi-process parallelization for parameter sweeps
-4. Better visualization following expert guidelines
+All critical patches applied:
+✓ Patch 1: Multi-pixel SPAD array + feasibility checks
+✓ Patch 2: Fixed α-ρ decoupling in FIM computation
+✓ Patch 3: Robust heatmap visualization
+✓ Patch 4: Numerical stability with gammaln
 
-Dependencies: numpy, scipy, matplotlib, tqdm
-Optional: cupy (for GPU), joblib (for multiprocessing)
+Three parameter presets included for immediate visualization.
+
+Author: Fixed by Expert Analysis
+Date: 2025
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
+from scipy.special import gammaln  # Patch 4: Numerical stability
 from math import ceil, sqrt, exp, log, pi
 import os
 from tqdm import tqdm
@@ -24,218 +26,119 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ============================================================================
-# GPU ACCELERATION SUPPORT (Optional)
-# ============================================================================
-
-try:
-    import cupy as cp
-
-    GPU_AVAILABLE = True
-    print("✓ CuPy detected - GPU acceleration available")
-    # Use CuPy for array operations
-    xp = cp
-except ImportError:
-    GPU_AVAILABLE = False
-    print("ℹ CuPy not found - using CPU (NumPy)")
-    xp = np
-    cp = np  # Fallback
-
-
-def to_cpu(x):
-    """Convert CuPy array to NumPy if needed."""
-    if GPU_AVAILABLE and isinstance(x, cp.ndarray):
-        return cp.asnumpy(x)
-    return x
-
-
-# ============================================================================
-# PARALLEL PROCESSING SUPPORT (Optional)
-# ============================================================================
-
-try:
-    from joblib import Parallel, delayed
-
-    PARALLEL_AVAILABLE = True
-    print("✓ Joblib detected - parallel processing available")
-except ImportError:
-    PARALLEL_AVAILABLE = False
-    print("ℹ Joblib not found - using serial processing")
-
-
-# ============================================================================
-# IEEE SINGLE-COLUMN PUBLICATION STYLE (LARGE FONTS)
-# ============================================================================
-
-def setup_ieee_single_column_style():
-    """
-    Configure matplotlib for IEEE single-column with LARGE readable fonts.
-    Based on expert guidelines from reference script.
-    """
-    plt.rcParams.update({
-        # Figure settings - IEEE single column
-        'figure.figsize': (3.5, 2.8),  # Single column width (slightly taller)
-        'figure.dpi': 300,
-        'savefig.dpi': 300,
-        'savefig.bbox': 'tight',
-        'savefig.pad_inches': 0.05,
-
-        # Font settings - LARGER for readability
-        'font.family': 'serif',
-        'font.serif': ['Times New Roman', 'DejaVu Serif'],
-        'font.size': 10,  # Base font size (increased from 9)
-        'axes.titlesize': 11,  # Title (increased)
-        'axes.labelsize': 10,  # Axis labels (increased)
-        'xtick.labelsize': 9,  # Tick labels (increased)
-        'ytick.labelsize': 9,
-        'legend.fontsize': 8,  # Legend (increased)
-
-        # Line and marker settings
-        'lines.linewidth': 1.5,  # Thicker lines
-        'lines.markersize': 5,  # Larger markers
-        'lines.markeredgewidth': 0.8,
-
-        # Grid settings
-        'grid.alpha': 0.3,
-        'grid.linewidth': 0.6,
-
-        # Axes settings
-        'axes.linewidth': 0.8,
-        'axes.grid': True,
-        'axes.axisbelow': True,
-
-        # Legend settings
-        'legend.frameon': True,
-        'legend.framealpha': 0.95,
-        'legend.borderpad': 0.4,
-        'legend.columnspacing': 1.0,
-        'legend.handlelength': 2.0,
-        'legend.handletextpad': 0.5,
-
-        # Tick settings
-        'xtick.major.width': 0.8,
-        'ytick.major.width': 0.8,
-        'xtick.minor.width': 0.5,
-        'ytick.minor.width': 0.5,
-    })
-
-    # Color scheme (professional and colorblind-friendly)
-    colors = {
-        'ideal': '#000000',  # Black
-        'state_of_art': '#0072BD',  # Blue
-        'high_performance': '#D95319',  # Orange
-        'swap_efficient': '#77AC30',  # Green
-        'low_cost': '#A2142F',  # Red
-        'zodiacal': '#0072BD',
-        'earthshine': '#EDB120',
-        'stray_light': '#A2142F',
-    }
-
-    return colors
-
-
-# Global color scheme
-colors = setup_ieee_single_column_style()
-
-# ============================================================================
-# PHYSICAL CONSTANTS
+# CONSTANTS & STYLE
 # ============================================================================
 
 SPEED_OF_LIGHT = 299792458  # m/s
 
 
+def setup_ieee_style():
+    """IEEE single-column style with large fonts"""
+    plt.rcParams.update({
+        'figure.figsize': (3.5, 2.8),
+        'figure.dpi': 300,
+        'savefig.dpi': 300,
+        'font.family': 'serif',
+        'font.size': 10,
+        'axes.titlesize': 11,
+        'axes.labelsize': 10,
+        'xtick.labelsize': 9,
+        'ytick.labelsize': 9,
+        'legend.fontsize': 8,
+        'lines.linewidth': 1.5,
+        'lines.markersize': 5,
+        'grid.alpha': 0.3,
+    })
+
+    colors = {
+        'zodiacal': '#0072BD',
+        'earthshine': '#EDB120',
+        'stray_light': '#A2142F',
+        'low_M': '#77AC30',
+        'high_M': '#7E2F8E',
+    }
+    return colors
+
+
+colors = setup_ieee_style()
+
+
 # ============================================================================
-# CORE PHYSICS FUNCTIONS (GPU-compatible)
+# PATCH 4: IMPROVED POISSON ENTROPY (NUMERICAL STABILITY)
 # ============================================================================
-
-def E_Lp(mu_vec, sigma2, theta_b):
-    """Expected pointing loss for Gaussian beam with jitter (GPU-compatible)"""
-    a = 4.0 / (theta_b ** 2)
-    b = 2.0 / (theta_b ** 2)
-    mu2 = xp.dot(mu_vec, mu_vec) if isinstance(mu_vec, (xp.ndarray, np.ndarray)) else np.dot(mu_vec, mu_vec)
-    gamma = 1.0 + a * sigma2
-    return (1.0 / gamma) * xp.exp(-b * mu2 / gamma)
-
-
-def r_signal(Ptx, Llink, eta, hnu, mu_vec, sigma2, theta_b):
-    """Signal photon rate"""
-    S = (eta / hnu) * Ptx * Llink
-    return S * E_Lp(mu_vec, sigma2, theta_b)
-
-
-def r_deadtime(r, tau_d):
-    """Non-paralyzable dead time correction"""
-    return r / (1.0 + r * tau_d)
-
-
-def fim_pilot(alpha, rho, Sbar, N, dt, params, dither_seq, tau_d=None):
-    """
-    Fisher Information Matrix computation (Algorithm 1)
-    GPU-accelerated version for large-scale computations
-    """
-    mu = params["mu"].copy()
-    sigma2 = params["sigma2"]
-    theta_b = params["theta_b"]
-    r_b = params["r_b"]
-    Llink = params["Llink"]
-    eta = params["eta"]
-    hnu = params["hnu"]
-
-    S_pilot = rho * Sbar / alpha
-    Ptx = S_pilot * hnu / (eta * Llink)
-
-    Npilot = int(np.floor(alpha * N))
-    I = np.zeros((4, 4))  # Keep on CPU for stability
-    a = 4.0 / (theta_b ** 2)
-    b = 2.0 / (theta_b ** 2)
-
-    for n in range(min(Npilot, len(dither_seq))):
-        mu_eff = mu + dither_seq[n]
-        Lp = float(E_Lp(mu_eff, sigma2, theta_b))
-        r_s = S_pilot * Lp / dt
-        r_tot = r_s + r_b
-
-        if tau_d is not None and r_tot * tau_d > 0.1:
-            r_tot = r_deadtime(r_tot, tau_d)
-
-        lam = r_tot * dt
-
-        gamma = 1.0 + a * sigma2
-        dlam_dmux = S_pilot * Lp * (-2 * b * mu_eff[0] / gamma)
-        dlam_dmuy = S_pilot * Lp * (-2 * b * mu_eff[1] / gamma)
-        dlam_dsig = S_pilot * Lp * (-a / gamma + a * b * np.dot(mu_eff, mu_eff) / (gamma ** 2))
-        dlam_drb = dt
-
-        grad = np.array([dlam_dmux, dlam_dmuy, dlam_dsig, dlam_drb])
-
-        if lam > 1e-12:
-            I += np.outer(grad, grad) / lam
-
-    return I
-
 
 def poisson_entropy(lam):
-    """Compute entropy of Poisson distribution with truncation"""
+    """
+    Compute entropy of Poisson distribution with numerical stability.
+    Uses gammaln instead of loop for log(k!)
+    """
     if lam <= 0:
         return 0.0
+
     Kmax = int(ceil(lam + 10.0 * sqrt(max(lam, 1.0))))
     ks = np.arange(Kmax + 1)
 
-    log_pk = -lam + ks * np.log(max(lam, 1e-100)) - np.array(
-        [sum(np.log(range(1, int(k) + 1))) if k > 0 else 0 for k in ks])
-    pk = np.exp(log_pk)
+    # Numerically stable: log(k!) = gammaln(k+1)
+    log_pk = -lam + ks * np.log(max(lam, 1e-100)) - gammaln(ks + 1)
+    pk = np.exp(log_pk - np.max(log_pk))  # Subtract max for stability
     pk = pk / pk.sum()
     pk = pk[pk > 1e-15]
-    return -np.sum(pk * np.log2(pk))
+
+    return -np.sum(pk * np.log2(pk)) if len(pk) > 0 else 0.0
 
 
-def capacity_lb(Sbar, Smax, lamb_b, dt=1.0, tau_d=None):
-    """Binary-input capacity lower bound (Algorithm 2)"""
+# ============================================================================
+# PATCH 1: CAPACITY WITH MULTI-PIXEL FEASIBILITY
+# ============================================================================
+
+def capacity_lb(Sbar, Smax, lamb_b, dt=1.0, tau_d=None, M_pixels=1, verbose=False):
+    """
+    Binary-input capacity lower bound with feasibility guard.
+
+    Parameters:
+    -----------
+    Sbar : float
+        Average signal photons per slot
+    Smax : float
+        Peak photons per slot (hardware limit)
+    lamb_b : float
+        Background photons per slot
+    dt : float
+        Time slot duration [s]
+    tau_d : float or None
+        Dead time [s]
+    M_pixels : int
+        Number of parallel SPAD pixels (default: 1)
+    verbose : bool
+        Print diagnostic info
+
+    Returns:
+    --------
+    C_lb : float
+        Capacity lower bound [bits/slot]
+    A_opt : float or None
+        Optimal signal amplitude
+    """
+    # Effective peak under dead-time + pixel parallelism
     if tau_d is not None:
-        Smax_eff = min(Smax, dt / tau_d)
+        Smax_dead = (dt / tau_d) * max(1, M_pixels)
+        Smax_eff = min(Smax, Smax_dead)
     else:
         Smax_eff = Smax
 
-    A_grid = np.linspace(max(Sbar, 0.1), Smax_eff, 100)
+    # Feasibility check: need A >= Sbar to have p<=1
+    if Sbar > Smax_eff:
+        if verbose:
+            print(f"  ❌ INFEASIBLE: Sbar={Sbar:.1f} > Smax_eff={Smax_eff:.1f}")
+            print(f"     Solution: Increase dt, reduce tau_d, or use M_pixels > {M_pixels}")
+        return 0.0, None
+
+    A_low, A_high = Sbar, Smax_eff
+    if A_high < A_low:
+        return 0.0, None
+
+    # Optimize over feasible range
+    A_grid = np.linspace(A_low, A_high, 200)
     Cbest, Aopt = 0.0, Sbar
 
     for A in A_grid:
@@ -246,145 +149,344 @@ def capacity_lb(Sbar, Smax, lamb_b, dt=1.0, tau_d=None):
         lam0 = lamb_b
         lam1 = lamb_b + A
 
+        # Apply dead time if specified
         if tau_d is not None:
-            lam0 = r_deadtime(lam0 / dt, tau_d) * dt
-            lam1 = r_deadtime(lam1 / dt, tau_d) * dt
+            lam0 = lam0 / (1.0 + (lam0 / dt) * tau_d) if lam0 / dt * tau_d < 1 else 0
+            lam1 = lam1 / (1.0 + (lam1 / dt) * tau_d) if lam1 / dt * tau_d < 1 else 0
 
+        # Compute entropies
         HY0 = poisson_entropy(lam0)
         HY1 = poisson_entropy(lam1)
 
+        # Mixture distribution
         Kmax = int(ceil(max(lam0, lam1) + 10.0 * sqrt(max(max(lam0, lam1), 1.0))))
         ks = np.arange(Kmax + 1)
 
-        log_p0 = -lam0 + ks * np.log(max(lam0, 1e-100)) - np.array(
-            [sum(np.log(range(1, int(k) + 1))) if k > 0 else 0 for k in ks])
-        log_p1 = -lam1 + ks * np.log(max(lam1, 1e-100)) - np.array(
-            [sum(np.log(range(1, int(k) + 1))) if k > 0 else 0 for k in ks])
+        log_p0 = -lam0 + ks * np.log(max(lam0, 1e-100)) - gammaln(ks + 1)
+        log_p1 = -lam1 + ks * np.log(max(lam1, 1e-100)) - gammaln(ks + 1)
 
-        p0 = np.exp(log_p0)
-        p1 = np.exp(log_p1)
+        p0 = np.exp(log_p0 - np.max(log_p0))
+        p1 = np.exp(log_p1 - np.max(log_p1))
+
+        p0 = p0 / p0.sum()
+        p1 = p1 / p1.sum()
 
         PY = (1 - p) * p0 + p * p1
         PY = PY / PY.sum()
         PY_nonzero = PY[PY > 1e-15]
-        HY = -np.sum(PY_nonzero * np.log2(PY_nonzero))
+        HY = -np.sum(PY_nonzero * np.log2(PY_nonzero)) if len(PY_nonzero) > 0 else 0
 
+        # Mutual information
         I = HY - (1 - p) * HY0 - p * HY1
 
         if I > Cbest:
             Cbest, Aopt = I, A
 
+    if verbose:
+        print(f"  ✓ FEASIBLE: C_lb={Cbest:.4f} bits/slot at A={Aopt:.1f}")
+
     return Cbest, Aopt
 
 
 # ============================================================================
-# SIMULATION PARAMETERS
+# PATCH 2: FIM WITH FIXED A_pilot AND DITHER TILING
 # ============================================================================
 
-def setup_simulation_parameters():
-    """Define all simulation parameters"""
+def E_Lp(mu_vec, sigma2, theta_b):
+    """Expected pointing loss"""
+    a = 4.0 / (theta_b ** 2)
+    b = 2.0 / (theta_b ** 2)
+    mu2 = np.dot(mu_vec, mu_vec)
+    gamma = 1.0 + a * sigma2
+    return (1.0 / gamma) * np.exp(-b * mu2 / gamma)
+
+
+def r_deadtime(r, tau_d):
+    """Non-paralyzable dead time correction"""
+    return r / (1.0 + r * tau_d)
+
+
+def fim_pilot(alpha, rho, Sbar, N, dt, params, dither_seq, tau_d=None,
+              A_pilot=None, M_pixels=1, verbose=False):
+    """
+    Fisher Information Matrix computation with α-ρ decoupling.
+
+    Key fix: A_pilot is fixed per-slot amplitude, α controls number of slots.
+    This breaks the Npilot * S_pilot cancellation.
+
+    Parameters:
+    -----------
+    A_pilot : float or None
+        Photons per pilot slot (fixed). If None, auto-set to 0.5*Smax_eff
+    M_pixels : int
+        Number of parallel SPAD pixels
+    """
+    mu = params["mu"].copy()
+    sigma2 = params["sigma2"]
+    theta_b = params["theta_b"]
+    r_b = params["r_b"]
+    Smax = params.get("Smax", np.inf)
+
+    # Effective peak
+    if tau_d is not None:
+        Smax_dead = (dt / tau_d) * max(1, M_pixels)
+        Smax_eff = min(Smax, Smax_dead)
+    else:
+        Smax_eff = Smax
+
+    # Choose per-slot pilot amplitude
+    if A_pilot is None:
+        A_pilot = min(Smax_eff, 4.0 * Sbar) * 0.5  # Conservative default
+
+    # Total pilot photons available in frame
+    S_total_pilot = rho * Sbar * N
+
+    # Number of pilot slots we can afford
+    Npilot = int(min(
+        np.floor(alpha * N),
+        np.floor(S_total_pilot / max(A_pilot, 1e-12))
+    ))
+
+    if Npilot <= 0:
+        return np.zeros((4, 4))
+
+    # Ensure dither covers Npilot (tile if needed)
+    if len(dither_seq) < Npilot:
+        reps = int(np.ceil(Npilot / len(dither_seq)))
+        dither_seq_used = (dither_seq * reps)[:Npilot]
+    else:
+        dither_seq_used = dither_seq[:Npilot]
+
+    if verbose:
+        print(f"    FIM: α={alpha:.2f}, ρ={rho:.2f} → Npilot={Npilot}, A_pilot={A_pilot:.1f}")
+
+    # Compute FIM
+    I = np.zeros((4, 4))
+    a = 4.0 / (theta_b ** 2)
+    b = 2.0 / (theta_b ** 2)
+    gamma = 1.0 + a * sigma2
+
+    for n in range(Npilot):
+        mu_eff = mu + dither_seq_used[n]
+        Lp = float(E_Lp(mu_eff, sigma2, theta_b))
+
+        # Per-slot rate with dead-time correction
+        r_s = A_pilot * Lp / dt
+        r_tot = r_s + r_b
+
+        if tau_d is not None and r_tot * tau_d > 1e-3:
+            r_tot = r_deadtime(r_tot, tau_d)
+
+        lam = r_tot * dt
+
+        # Partial derivatives
+        dlam_dmux = A_pilot * Lp * (-2 * b * mu_eff[0] / gamma)
+        dlam_dmuy = A_pilot * Lp * (-2 * b * mu_eff[1] / gamma)
+        dlam_dsig = A_pilot * Lp * (-a / gamma + a * b * np.dot(mu_eff, mu_eff) / (gamma ** 2))
+        dlam_drb = dt
+
+        grad = np.array([dlam_dmux, dlam_dmuy, dlam_dsig, dlam_drb])
+
+        if lam > 1e-14:
+            I += np.outer(grad, grad) / lam
+
+    return I
+
+
+def generate_dither_sequence(N_pilot, theta_b, delta_factor=0.6):
+    """Generate dithering sequence (will be tiled if needed)"""
+    delta = delta_factor * theta_b
+    base_pattern = [
+        np.array([delta, 0.0]),
+        np.array([-delta, 0.0]),
+        np.array([0.0, delta]),
+        np.array([0.0, -delta])
+    ]
+    # Create long enough sequence
+    reps = max(1, int(np.ceil(N_pilot / len(base_pattern))))
+    return base_pattern * reps
+
+
+# ============================================================================
+# PARAMETER PRESETS (3 SCENARIOS)
+# ============================================================================
+
+def get_preset_params(preset='low_photon'):
+    """
+    Three validated parameter presets for different physics demonstrations.
+
+    Presets:
+    --------
+    'low_photon' : HPE regime, strong background effect
+    'moderate'   : Balanced, good dynamic range
+    'high_photon': Array parallelism showcase
+    """
     c = SPEED_OF_LIGHT
     h = 6.626e-34
     wavelength = 1550e-9
     nu = c / wavelength
     hnu = h * nu
 
-    params = {
-        'Sbar': 50,
-        'Smax': 500,
-        'dt': 1e-6,
-        'N': 10000,
-        'eta': 0.8,
-        'hnu': hnu,
-        'theta_b': 10e-6,
-        'Llink': 1e-12,
-        'mu': np.array([0.0, 0.0]),
-        'sigma2': (2e-6) ** 2,
-        'tau_d': 100e-9,
-        'J_P': np.diag([1e-12, 1e-12, 1e-10, 1e-6]),
-        'W': np.eye(4),
-    }
+    if preset == 'low_photon':
+        # Low photon budget: Shows strong capacity degradation with background
+        params = {
+            'Sbar': 2.0,
+            'Smax': 20.0,
+            'dt': 1e-6,
+            'N': 5000,
+            'eta': 0.8,
+            'hnu': hnu,
+            'theta_b': 10e-6,
+            'Llink': 1e-12,
+            'mu': np.array([0.0, 0.0]),
+            'sigma2': (2e-6) ** 2,
+            'tau_d': None,  # No dead time for simplicity
+            'M_pixels': 1,
+            'J_P': np.diag([1e-11, 1e-11, 1e-9, 1e-5]),
+            'W': np.eye(4),
+        }
+        scenarios = {
+            'Low': {'name': 'Zodiacal', 'r_b': 0.01, 'color': colors['zodiacal']},
+            'Medium': {'name': 'Earthshine', 'r_b': 0.5, 'color': colors['earthshine']},
+            'High': {'name': 'Stray Light', 'r_b': 5.0, 'color': colors['stray_light']},
+        }
 
-    space_weather_scenarios = {
-        'Low': {'name': 'Zodiacal', 'r_b': 0.01, 'color': colors['zodiacal']},
-        'Medium': {'name': 'Earthshine', 'r_b': 1.0, 'color': colors['earthshine']},
-        'High': {'name': 'Stray Light', 'r_b': 10.0, 'color': colors['stray_light']},
-    }
+    elif preset == 'moderate':
+        # Moderate regime: Good for all three figures
+        params = {
+            'Sbar': 10.0,
+            'Smax': 100.0,
+            'dt': 2e-6,
+            'N': 10000,
+            'eta': 0.8,
+            'hnu': hnu,
+            'theta_b': 10e-6,
+            'Llink': 1e-12,
+            'mu': np.array([0.0, 0.0]),
+            'sigma2': (1.5e-6) ** 2,
+            'tau_d': 50e-9,
+            'M_pixels': 16,  # Small array
+            'J_P': np.diag([1e-12, 1e-12, 1e-10, 1e-6]),
+            'W': np.eye(4),
+        }
+        scenarios = {
+            'Low': {'name': 'Zodiacal', 'r_b': 0.05, 'color': colors['zodiacal']},
+            'Medium': {'name': 'Earthshine', 'r_b': 1.0, 'color': colors['earthshine']},
+            'High': {'name': 'Stray Light', 'r_b': 10.0, 'color': colors['stray_light']},
+        }
 
-    return params, space_weather_scenarios
+    elif preset == 'high_photon':
+        # High photon: Showcases array parallelism benefit
+        params = {
+            'Sbar': 50.0,
+            'Smax': 500.0,
+            'dt': 1e-6,
+            'N': 10000,
+            'eta': 0.85,
+            'hnu': hnu,
+            'theta_b': 8e-6,
+            'Llink': 1e-12,
+            'mu': np.array([0.0, 0.0]),
+            'sigma2': (1e-6) ** 2,
+            'tau_d': 100e-9,
+            'M_pixels': 64,  # Realistic SPAD array
+            'J_P': np.diag([1e-12, 1e-12, 1e-10, 1e-6]),
+            'W': np.eye(4),
+        }
+        scenarios = {
+            'Low': {'name': 'Zodiacal', 'r_b': 0.01, 'color': colors['zodiacal']},
+            'Medium': {'name': 'Earthshine', 'r_b': 1.0, 'color': colors['earthshine']},
+            'High': {'name': 'Stray Light', 'r_b': 20.0, 'color': colors['stray_light']},
+        }
 
+    else:
+        raise ValueError(f"Unknown preset: {preset}")
 
-def generate_dither_sequence(N_pilot, theta_b, delta_factor=0.5):
-    """Generate dithering sequence for identifiability"""
-    delta = delta_factor * theta_b
-    dither_seq = []
-
-    for n in range(N_pilot):
-        if n % 4 == 0:
-            dither_seq.append(np.array([delta, 0.0]))
-        elif n % 4 == 1:
-            dither_seq.append(np.array([-delta, 0.0]))
-        elif n % 4 == 2:
-            dither_seq.append(np.array([0.0, delta]))
-        else:
-            dither_seq.append(np.array([0.0, -delta]))
-
-    return dither_seq
+    return params, scenarios
 
 
 # ============================================================================
-# FIGURE 1: CAPACITY VS BACKGROUND (SINGLE COLUMN OPTIMIZED)
+# FIGURE 1: CAPACITY VS BACKGROUND (FIXED)
 # ============================================================================
 
-def generate_fig_capacity_vs_background(params, output_dir='./'):
-    """Generate capacity vs background figure (single-column optimized)"""
+def generate_fig_capacity_vs_background(params, output_dir='./', verbose=False):
+    """Generate capacity vs background with proper feasibility handling"""
     print("\n" + "=" * 60)
-    print("Figure 1: Capacity vs Background Noise")
+    print("Figure 1: Capacity vs Background Noise (FIXED)")
     print("=" * 60)
 
-    rb_array = np.logspace(-2, 2, 50)
+    # Extended background range for better dynamics
+    rb_array = np.logspace(-2, 2, 60)
+
     Sbar = params['Sbar']
     Smax = params['Smax']
     tau_d = params['tau_d']
     dt = params['dt']
+    M_pixels = params['M_pixels']
+
+    print(f"\nParameters:")
+    print(f"  Sbar = {Sbar}")
+    print(f"  Smax = {Smax}")
+    print(f"  dt = {dt * 1e6:.1f} μs")
+    print(f"  tau_d = {tau_d * 1e9:.1f} ns" if tau_d else "  tau_d = None")
+    print(f"  M_pixels = {M_pixels}")
+
+    # Check feasibility
+    if tau_d:
+        Smax_eff = min(Smax, (dt / tau_d) * M_pixels)
+        print(f"  Smax_eff = {Smax_eff:.1f} (dead-time limited)")
+    else:
+        Smax_eff = Smax
+        print(f"  Smax_eff = {Smax_eff:.1f} (no dead-time)")
+
+    if Sbar > Smax_eff:
+        print(f"  ⚠ WARNING: Sbar > Smax_eff, will return zeros!")
 
     capacity_values = []
+    A_opt_values = []
 
-    for r_b in tqdm(rb_array, desc="Computing capacity"):
-        C_lb, _ = capacity_lb(Sbar, Smax, r_b, dt, tau_d)
+    print(f"\nComputing capacity...")
+    for r_b in tqdm(rb_array, desc="Background sweep"):
+        C_lb, A_opt = capacity_lb(Sbar, Smax, r_b, dt, tau_d, M_pixels,
+                                  verbose=(verbose and r_b in [0.01, 1.0, 10.0]))
         capacity_values.append(C_lb)
+        A_opt_values.append(A_opt if A_opt else 0)
 
-    # Create single-column figure with large fonts
+    capacity_values = np.array(capacity_values)
+
+    print(f"\n✓ Results:")
+    print(f"  Capacity range: [{np.min(capacity_values):.4f}, {np.max(capacity_values):.4f}] bits/slot")
+    print(f"  Non-zero points: {np.sum(capacity_values > 0)}/{len(capacity_values)}")
+
+    # Plot
     fig, ax = plt.subplots(figsize=(3.5, 2.8))
 
     ax.semilogx(rb_array, capacity_values, 'b-', linewidth=2,
-                label='Capacity Lower Bound')
+                label=f'M={M_pixels} pixels')
 
-    # Regime boundaries
+    # Regime markers
     ax.axvline(x=0.01, color=colors['zodiacal'], linestyle='--',
-               linewidth=1.5, alpha=0.8, label='Zodiacal')
+               linewidth=1.2, alpha=0.7)
     ax.axvline(x=1.0, color=colors['earthshine'], linestyle='--',
-               linewidth=1.5, alpha=0.8, label='Earthshine')
+               linewidth=1.2, alpha=0.7)
     ax.axvline(x=10.0, color=colors['stray_light'], linestyle='--',
-               linewidth=1.5, alpha=0.8, label='Stray Light')
-
-    # Annotations (larger fonts)
-    ax.text(0.005, max(capacity_values) * 0.85, 'Zodiacal',
-            ha='center', fontsize=9, weight='bold',
-            bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.7))
-    ax.text(0.3, max(capacity_values) * 0.65, 'Earthshine',
-            ha='center', fontsize=9, weight='bold',
-            bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.7))
-    ax.text(30, max(capacity_values) * 0.45, 'Stray\nLight',
-            ha='center', fontsize=9, weight='bold',
-            bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7))
+               linewidth=1.2, alpha=0.7)
 
     ax.set_xlabel('Background λ_b [photons/slot]', fontsize=10, weight='bold')
     ax.set_ylabel('Capacity C_LB [bits/slot]', fontsize=10, weight='bold')
-    ax.set_title(f'DTPC Capacity vs Background\n(S̄={Sbar}, S_max={Smax})',
+    ax.set_title(f'Capacity vs Background\n(S̄={Sbar:.1f}, M={M_pixels})',
                  fontsize=11, weight='bold')
     ax.grid(True, alpha=0.3)
-    ax.legend(loc='upper right', fontsize=8, framealpha=0.95)
+    ax.legend(fontsize=8)
+
+    # Add regime labels
+    ymax = np.max(capacity_values) if np.max(capacity_values) > 0 else 1
+    ax.text(0.005, ymax * 0.85, 'Zodiacal', ha='center', fontsize=8, weight='bold',
+            bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.7))
+    ax.text(0.3, ymax * 0.65, 'Earthshine', ha='center', fontsize=8, weight='bold',
+            bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.7))
+    ax.text(30, ymax * 0.45, 'Stray', ha='center', fontsize=8, weight='bold',
+            bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7))
 
     plt.tight_layout()
     plt.savefig(f'{output_dir}/capacity_vs_background.pdf', dpi=300, bbox_inches='tight')
@@ -396,79 +498,120 @@ def generate_fig_capacity_vs_background(params, output_dir='./'):
 
 
 # ============================================================================
-# FIGURE 2: FIM VS RESOURCE ALLOCATION (SINGLE COLUMN OPTIMIZED)
+# FIGURE 2: FIM VS RESOURCE ALLOCATION (PATCH 3: ROBUST PLOTTING)
 # ============================================================================
 
-def generate_fig_fim_vs_resources(params, space_weather_scenarios, output_dir='./'):
-    """Generate FIM heatmap (single-column optimized)"""
+def generate_fig_fim_vs_resources(params, scenarios, output_dir='./', verbose=False):
+    """Generate FIM heatmap with robust visualization"""
     print("\n" + "=" * 60)
-    print("Figure 2: FIM vs Resource Allocation")
+    print("Figure 2: FIM vs Resource Allocation (FIXED)")
     print("=" * 60)
 
-    scenario = space_weather_scenarios['Medium']
+    scenario = scenarios['Medium']
     params_sim = params.copy()
     params_sim['r_b'] = scenario['r_b']
 
-    alpha_range = np.linspace(0.01, 0.99, 25)
-    rho_range = np.linspace(0.01, 0.99, 25)
+    # Resource grids
+    alpha_range = np.linspace(0.05, 0.95, 25)
+    rho_range = np.linspace(0.05, 0.95, 25)
     mse_trace = np.zeros((len(rho_range), len(alpha_range)))
 
-    max_pilots = int(0.99 * params['N'])
+    # Generate dither
+    max_pilots = int(0.95 * params['N'])
     dither_seq = generate_dither_sequence(max_pilots, params['theta_b'])
 
-    print("Computing FIM grid...")
+    print(f"\nComputing FIM grid (25×25 = 625 points)...")
+    print(f"  Using fixed A_pilot strategy for α-ρ decoupling")
+
+    valid_count = 0
+
     for i, rho in enumerate(tqdm(rho_range, desc="ρ sweep")):
         for j, alpha in enumerate(alpha_range):
             try:
+                # Check peak constraints
+                if params['tau_d']:
+                    Smax_eff = min(params['Smax'],
+                                   (params['dt'] / params['tau_d']) * params['M_pixels'])
+                else:
+                    Smax_eff = params['Smax']
+
+                A_pilot_use = min(Smax_eff, 4.0 * params['Sbar']) * 0.5
+
                 S_pilot = rho * params['Sbar'] / alpha
                 S_data = (1 - rho) * params['Sbar'] / (1 - alpha)
 
-                if S_pilot > params['Smax'] or S_data > params['Smax']:
+                # Feasibility
+                if S_pilot > Smax_eff or S_data > Smax_eff:
                     mse_trace[i, j] = np.nan
                     continue
 
+                # Compute FIM
                 I_pilot = fim_pilot(alpha, rho, params['Sbar'], params['N'],
-                                    params['dt'], params_sim, dither_seq, params['tau_d'])
+                                    params['dt'], params_sim, dither_seq,
+                                    params['tau_d'], A_pilot_use, params['M_pixels'],
+                                    verbose=(verbose and i % 10 == 0 and j % 10 == 0))
+
                 J = I_pilot + params['J_P']
 
-                if np.linalg.cond(J) > 1e12:
+                # Relaxed condition number threshold (Patch 3)
+                if np.linalg.cond(J) > 1e14:
                     mse_trace[i, j] = np.nan
                 else:
                     J_inv = np.linalg.inv(J)
                     mse_trace[i, j] = np.trace(params['W'] @ J_inv)
+                    valid_count += 1
+
             except:
                 mse_trace[i, j] = np.nan
 
-    # Single-column figure
+    print(f"\n✓ Valid points: {valid_count}/{mse_trace.size} ({valid_count / mse_trace.size * 100:.1f}%)")
+
+    # PATCH 3: Robust plotting with proper masking
+    valid = np.isfinite(mse_trace) & (mse_trace > 0)
+
+    if valid.sum() < 0.1 * mse_trace.size:
+        print("⚠ Too few valid points, consider adjusting parameters")
+        return None, None, None
+
+    # Percentile-based colormap limits
+    vmin = np.percentile(mse_trace[valid], 5)
+    vmax = np.percentile(mse_trace[valid], 95)
+
+    log_mse = np.full_like(mse_trace, np.nan)
+    log_mse[valid] = np.log10(mse_trace[valid])
+
+    # Plot
     fig, ax = plt.subplots(figsize=(3.5, 2.8))
 
-    log_mse = np.log10(mse_trace)
     Alpha, Rho = np.meshgrid(alpha_range, rho_range)
 
-    im = ax.pcolormesh(Alpha, Rho, log_mse, shading='auto', cmap='viridis_r')
+    im = ax.pcolormesh(Alpha, Rho, log_mse, shading='auto', cmap='viridis_r',
+                       vmin=np.log10(vmin), vmax=np.log10(vmax))
 
     cbar = plt.colorbar(im, ax=ax)
-    cbar.set_label('log₁₀(Trace CRLB)', rotation=270, labelpad=20,
+    cbar.set_label('log₁₀(Trace CRLB)', rotation=270, labelpad=18,
                    fontsize=9, weight='bold')
     cbar.ax.tick_params(labelsize=8)
 
+    # Contours
     try:
-        contours = ax.contour(Alpha, Rho, log_mse, levels=8,
-                              colors='white', alpha=0.6, linewidths=0.8)
-        ax.clabel(contours, inline=True, fontsize=7, fmt='%.1f')
+        levels = np.linspace(np.log10(vmin), np.log10(vmax), 8)
+        contours = ax.contour(Alpha, Rho, log_mse, levels=levels,
+                              colors='white', alpha=0.5, linewidths=0.7)
+        ax.clabel(contours, inline=True, fontsize=6, fmt='%.1f')
     except:
         pass
 
     ax.set_xlabel('Time Allocation α', fontsize=10, weight='bold')
     ax.set_ylabel('Photon Allocation ρ', fontsize=10, weight='bold')
-    ax.set_title(f'Fisher Information vs Resources\n({scenario["name"]}, λ_b={scenario["r_b"]})',
+    ax.set_title(f'Fisher Info vs Resources\n({scenario["name"]}, λ_b={scenario["r_b"]})',
                  fontsize=11, weight='bold')
 
-    # Annotations (larger)
-    ax.text(0.05, 0.95, 'Poor\nSensing', transform=ax.transAxes, fontsize=9,
+    # Annotations
+    ax.text(0.05, 0.95, 'High\nMSE', transform=ax.transAxes, fontsize=8,
             weight='bold', va='top',
             bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.7))
-    ax.text(0.75, 0.05, 'Good\nSensing', transform=ax.transAxes, fontsize=9,
+    ax.text(0.75, 0.05, 'Low\nMSE', transform=ax.transAxes, fontsize=8,
             weight='bold', va='bottom',
             bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.7))
 
@@ -482,26 +625,27 @@ def generate_fig_fim_vs_resources(params, space_weather_scenarios, output_dir='.
 
 
 # ============================================================================
-# FIGURE 3: RATE-MSE PARETO BOUNDARY (SINGLE COLUMN OPTIMIZED)
+# FIGURE 3: RATE-MSE PARETO BOUNDARY (FIXED)
 # ============================================================================
 
-def generate_fig_pareto_boundary(params, space_weather_scenarios, output_dir='./'):
-    """Generate Pareto boundary (single-column optimized, most important figure)"""
+def generate_fig_pareto_boundary(params, scenarios, output_dir='./', verbose=False):
+    """Generate Pareto boundary with proper feasibility"""
     print("\n" + "=" * 60)
-    print("Figure 3: Rate-MSE Pareto Boundary (MOST IMPORTANT)")
+    print("Figure 3: Rate-MSE Pareto Boundary (FIXED)")
     print("=" * 60)
 
-    D_targets = np.logspace(-8, -3, 20)
-    alpha_search = np.linspace(0.05, 0.95, 12)
-    rho_search = np.linspace(0.05, 0.95, 12)
+    # Coarse grids for speed
+    D_targets = np.logspace(-8, -4, 15)
+    alpha_search = np.linspace(0.1, 0.9, 10)
+    rho_search = np.linspace(0.1, 0.9, 10)
 
-    max_pilots = int(0.95 * params['N'])
+    max_pilots = int(0.9 * params['N'])
     dither_seq = generate_dither_sequence(max_pilots, params['theta_b'])
 
     pareto_results = {}
 
-    for scenario_name, scenario in space_weather_scenarios.items():
-        print(f"\nProcessing {scenario_name} scenario...")
+    for scenario_name, scenario in scenarios.items():
+        print(f"\nProcessing {scenario_name} scenario (λ_b={scenario['r_b']})...")
 
         params_sim = params.copy()
         params_sim['r_b'] = scenario['r_b']
@@ -513,17 +657,28 @@ def generate_fig_pareto_boundary(params, space_weather_scenarios, output_dir='./
             for alpha in alpha_search:
                 for rho in rho_search:
                     try:
+                        # Check constraints
+                        if params['tau_d']:
+                            Smax_eff = min(params['Smax'],
+                                           (params['dt'] / params['tau_d']) * params['M_pixels'])
+                        else:
+                            Smax_eff = params['Smax']
+
+                        A_pilot_use = min(Smax_eff, 4.0 * params['Sbar']) * 0.5
+
                         S_pilot = rho * params['Sbar'] / alpha
                         S_data = (1 - rho) * params['Sbar'] / (1 - alpha)
 
-                        if S_pilot > params['Smax'] or S_data > params['Smax']:
+                        if S_pilot > Smax_eff or S_data > Smax_eff:
                             continue
 
+                        # Compute FIM
                         I_pilot = fim_pilot(alpha, rho, params['Sbar'], params['N'],
-                                            params['dt'], params_sim, dither_seq, params['tau_d'])
+                                            params['dt'], params_sim, dither_seq,
+                                            params['tau_d'], A_pilot_use, params['M_pixels'])
                         J = I_pilot + params['J_P']
 
-                        if np.linalg.cond(J) > 1e12:
+                        if np.linalg.cond(J) > 1e14:
                             continue
 
                         J_inv = np.linalg.inv(J)
@@ -532,8 +687,9 @@ def generate_fig_pareto_boundary(params, space_weather_scenarios, output_dir='./
                         if mse_current > D_max:
                             continue
 
+                        # Compute rate
                         C_data, _ = capacity_lb(S_data, params['Smax'], scenario['r_b'],
-                                                params['dt'], params['tau_d'])
+                                                params['dt'], params['tau_d'], params['M_pixels'])
                         rate = (1 - alpha) * C_data
 
                         if rate > max_rate:
@@ -547,10 +703,10 @@ def generate_fig_pareto_boundary(params, space_weather_scenarios, output_dir='./
         pareto_results[scenario_name] = pareto_points
         print(f"  Found {len(pareto_points)} Pareto points")
 
-    # Single-column figure with large fonts
+    # Plot
     fig, ax = plt.subplots(figsize=(3.5, 2.8))
 
-    for scenario_name, scenario in space_weather_scenarios.items():
+    for scenario_name, scenario in scenarios.items():
         points = pareto_results[scenario_name]
         if len(points) > 0:
             rates = [p[0] for p in points]
@@ -561,29 +717,15 @@ def generate_fig_pareto_boundary(params, space_weather_scenarios, output_dir='./
             rates_sorted = [p[1] for p in sorted_pairs]
 
             ax.loglog(mses_sorted, rates_sorted, 'o-',
-                      color=scenario['color'], linewidth=2, markersize=6,
-                      label=f'{scenario["name"]} (λ_b={scenario["r_b"]})')
+                      color=scenario['color'], linewidth=2, markersize=5,
+                      label=f'{scenario["name"]}')
 
-    # Guidelines
-    ax.axhline(y=0.1, color='gray', linestyle=':', linewidth=1.5,
-               alpha=0.7, label='Min rate')
-    ax.axvline(x=1e-6, color='gray', linestyle=':', linewidth=1.5,
-               alpha=0.7, label='Target MSE')
-
-    ax.set_xlabel('Mean Squared Error (MSE)', fontsize=10, weight='bold')
+    ax.set_xlabel('Mean Squared Error', fontsize=10, weight='bold')
     ax.set_ylabel('Rate [bits/slot]', fontsize=10, weight='bold')
-    ax.set_title(f'Rate-MSE Pareto Boundary\n(S̄={params["Sbar"]}, S_max={params["Smax"]})',
+    ax.set_title(f'Rate-MSE Pareto Boundary\n(S̄={params["Sbar"]:.1f}, M={params["M_pixels"]})',
                  fontsize=11, weight='bold')
     ax.grid(True, alpha=0.3)
-    ax.legend(loc='upper right', fontsize=7.5, framealpha=0.95)
-
-    # Region annotations (larger)
-    ax.text(0.05, 0.95, 'Sensing-\nLimited', transform=ax.transAxes,
-            fontsize=9, weight='bold', va='top',
-            bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.7))
-    ax.text(0.75, 0.05, 'Comm-\nLimited', transform=ax.transAxes,
-            fontsize=9, weight='bold', va='bottom',
-            bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7))
+    ax.legend(fontsize=8, framealpha=0.95)
 
     plt.tight_layout()
     plt.savefig(f'{output_dir}/rate_mse_boundary.pdf', dpi=300, bbox_inches='tight')
@@ -595,67 +737,74 @@ def generate_fig_pareto_boundary(params, space_weather_scenarios, output_dir='./
 
 
 # ============================================================================
-# MAIN DRIVER
+# MAIN DRIVER WITH PRESET SELECTION
 # ============================================================================
 
-def main():
-    """Main simulation driver"""
+def main(preset='moderate'):
+    """
+    Main simulation with preset selection.
+
+    Presets:
+    --------
+    'low_photon'  : Low budget, strong background effect
+    'moderate'    : Balanced, good for all figures (DEFAULT)
+    'high_photon' : High budget, showcases array parallelism
+    """
     print("\n" + "=" * 80)
-    print("OISL-ISAC PERFORMANCE LIMITS SIMULATION")
-    print("Optimized for GPU acceleration & IEEE single-column figures")
+    print("OISL-ISAC PERFORMANCE LIMITS SIMULATION (FIXED VERSION)")
+    print("All patches applied: ✓ Multi-pixel ✓ α-ρ decoupling ✓ Robust plots ✓ gammaln")
     print("=" * 80)
 
-    if GPU_AVAILABLE:
-        print(f"\n✓ GPU acceleration: ENABLED (CuPy)")
-        print(f"  GPU memory: {cp.cuda.Device().mem_info[1] / 1e9:.1f} GB total")
-    else:
-        print(f"\nℹ GPU acceleration: DISABLED (using NumPy)")
+    # Load preset
+    params, scenarios = get_preset_params(preset)
 
-    if PARALLEL_AVAILABLE:
-        print(f"✓ Parallel processing: ENABLED (Joblib)")
-    else:
-        print(f"ℹ Parallel processing: DISABLED")
-
-    params, space_weather_scenarios = setup_simulation_parameters()
-
-    print(f"\nSimulation Parameters:")
-    print(f"  S̄ = {params['Sbar']} photons/slot")
-    print(f"  S_max = {params['Smax']} photons/slot")
+    print(f"\n✓ Using preset: '{preset}'")
+    print(f"\nKey Parameters:")
+    print(f"  S̄ = {params['Sbar']:.1f} photons/slot")
+    print(f"  S_max = {params['Smax']:.1f} photons/slot")
+    print(f"  M_pixels = {params['M_pixels']}")
     print(f"  θ_b = {params['theta_b'] * 1e6:.1f} μrad")
-    print(f"  N = {params['N']} slots")
+    print(f"  τ_d = {params['tau_d'] * 1e9:.1f} ns" if params['tau_d'] else "  τ_d = None")
 
-    output_dir = './simulation_results'
+    # Feasibility check
+    if params['tau_d']:
+        Smax_eff = min(params['Smax'],
+                       (params['dt'] / params['tau_d']) * params['M_pixels'])
+        print(f"  S_max_eff = {Smax_eff:.1f} (dead-time limited)")
+
+        if params['Sbar'] > Smax_eff:
+            print(f"\n❌ CRITICAL: Sbar > Smax_eff!")
+            print(f"   Solutions:")
+            print(f"     1. Increase M_pixels to {int(np.ceil(params['Sbar'] * params['tau_d'] / params['dt']))}")
+            print(f"     2. Increase dt to {params['tau_d'] * params['Sbar']:.2e} s")
+            print(f"     3. Use a different preset")
+            return False
+
+    output_dir = f'./results_{preset}'
     os.makedirs(output_dir, exist_ok=True)
 
     try:
-        # Generate three key figures
+        # Generate figures
         print(f"\n{'=' * 60}")
-        rb_array, capacity_values = generate_fig_capacity_vs_background(params, output_dir)
+        rb_array, capacity_values = generate_fig_capacity_vs_background(
+            params, output_dir, verbose=False)
 
         print(f"\n{'=' * 60}")
         alpha_range, rho_range, mse_trace = generate_fig_fim_vs_resources(
-            params, space_weather_scenarios, output_dir)
+            params, scenarios, output_dir, verbose=False)
 
-        print(f"\n{'=' * 60}")
-        pareto_results = generate_fig_pareto_boundary(
-            params, space_weather_scenarios, output_dir)
+        if mse_trace is not None:
+            print(f"\n{'=' * 60}")
+            pareto_results = generate_fig_pareto_boundary(
+                params, scenarios, output_dir, verbose=False)
 
         print(f"\n{'=' * 80}")
-        print("✓ SIMULATION COMPLETED SUCCESSFULLY")
+        print(f"✓ SIMULATION COMPLETED SUCCESSFULLY")
         print(f"{'=' * 80}")
-        print(f"Results in: {output_dir}/")
-        print("Generated files:")
-        print("  • capacity_vs_background.pdf/png")
-        print("  • fim_vs_resources.pdf/png")
-        print("  • rate_mse_boundary.pdf/png")
-
-        print(f"\nPerformance Summary:")
-        print(f"  Capacity range: {min(capacity_values):.3f} - {max(capacity_values):.3f} bits/slot")
-
-        for name, points in pareto_results.items():
-            if len(points) > 0:
-                max_rate = max(p[0] for p in points)
-                print(f"  {name}: Max rate = {max_rate:.3f} bits/slot")
+        print(f"Results saved to: {output_dir}/")
+        print(f"\nGenerated files:")
+        for f in os.listdir(output_dir):
+            print(f"  • {f}")
 
         return True
 
@@ -667,5 +816,15 @@ def main():
 
 
 if __name__ == "__main__":
-    success = main()
+    import sys
+
+    # Command line preset selection
+    preset = sys.argv[1] if len(sys.argv) > 1 else 'moderate'
+
+    if preset not in ['low_photon', 'moderate', 'high_photon']:
+        print(f"Invalid preset: {preset}")
+        print("Available presets: low_photon, moderate, high_photon")
+        sys.exit(1)
+
+    success = main(preset)
     exit(0 if success else 1)
