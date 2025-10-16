@@ -702,13 +702,77 @@ def main(preset='moderate'):
 
 if __name__ == "__main__":
     import sys
+    import time
 
-    preset = sys.argv[1] if len(sys.argv) > 1 else 'moderate'
+    # 检查命令行参数
+    if len(sys.argv) > 1:
+        # 单个预设模式（保留原有功能）
+        preset = sys.argv[1]
 
-    if preset not in ['low_photon', 'moderate', 'high_photon']:
-        print(f"Invalid preset: {preset}")
-        print("Available: low_photon, moderate, high_photon")
-        sys.exit(1)
+        if preset == 'all':
+            # 运行所有预设
+            presets_to_run = ['low_photon', 'moderate', 'high_photon']
+        elif preset in ['low_photon', 'moderate', 'high_photon']:
+            presets_to_run = [preset]
+        else:
+            print(f"❌ Invalid preset: {preset}")
+            print("Available options:")
+            print("  - low_photon")
+            print("  - moderate")
+            print("  - high_photon")
+            print("  - all         (run all three presets)")
+            sys.exit(1)
+    else:
+        # 默认运行所有预设
+        print("ℹ️  No preset specified, running ALL presets by default")
+        print("   (Use 'python main_simulation.py <preset>' to run a specific one)")
+        presets_to_run = ['low_photon', 'moderate', 'high_photon']
 
-    success = main(preset)
-    exit(0 if success else 1)
+    # 运行所有选定的预设
+    print("\n" + "=" * 80)
+    print(f"🚀 RUNNING {len(presets_to_run)} PRESET(S)")
+    print("=" * 80)
+
+    results = {}
+    total_start = time.time()
+
+    for i, preset in enumerate(presets_to_run, 1):
+        print(f"\n{'=' * 80}")
+        print(f"📊 [{i}/{len(presets_to_run)}] Starting preset: {preset.upper()}")
+        print(f"{'=' * 80}")
+
+        start_time = time.time()
+        success = main(preset)
+        elapsed = time.time() - start_time
+
+        results[preset] = {
+            'success': success,
+            'time': elapsed
+        }
+
+        print(f"\n{'=' * 80}")
+        if success:
+            print(f"✅ [{i}/{len(presets_to_run)}] {preset.upper()} completed in {elapsed:.1f}s")
+        else:
+            print(f"❌ [{i}/{len(presets_to_run)}] {preset.upper()} FAILED after {elapsed:.1f}s")
+        print(f"{'=' * 80}")
+
+    # 总结报告
+    total_elapsed = time.time() - total_start
+    print("\n" + "=" * 80)
+    print("📋 EXECUTION SUMMARY")
+    print("=" * 80)
+
+    for preset, result in results.items():
+        status = "✅ SUCCESS" if result['success'] else "❌ FAILED"
+        print(f"  {preset:15s} │ {status:12s} │ {result['time']:6.1f}s")
+
+    print(f"\n  Total time: {total_elapsed:.1f}s ({total_elapsed / 60:.1f} min)")
+
+    # 统计成功率
+    success_count = sum(1 for r in results.values() if r['success'])
+    print(f"  Success rate: {success_count}/{len(results)}")
+
+    # 退出状态
+    all_success = all(r['success'] for r in results.values())
+    exit(0 if all_success else 1)
