@@ -1,225 +1,280 @@
-# OISL-ISAC Section IV Configuration
-# IEEE Transactions Paper - Numerical Results Parameters
-# =======================================================
+# ============================================================================
+# OISL-ISAC Simulation Configuration - Publication Version
+# ============================================================================
+# IEEE Transactions Paper - Complete System Parameters
+#
+# This file contains all adjustable parameters for the simulation suite.
+# Organized by functional modules for clarity.
+# ============================================================================
 
-# Physical Constants
-physical_constants:
-  speed_of_light: 299792458  # m/s
-  planck_constant: 6.626e-34  # J·s
-  wavelength: 1550e-9  # m (C-band)
-  photon_energy: 1.282e-19  # J
-
-# System Parameters (Main Simulation)
+# ----------------------------------------------------------------------------
+# SYSTEM PARAMETERS - Core Physical Model
+# ----------------------------------------------------------------------------
 system_parameters:
-  # Basic photon budget
-  Sbar: 10.0  # Average signal photons per slot
-  Smax: 100.0  # Peak signal photons per slot
+  # Photon budget constraints
+  Sbar: 50.0                    # Average signal photons per slot
+  Smax: 100.0                   # Peak signal photons per slot (before dead-time)
 
-  # Timing
-  dt: 1.0e-6  # Slot duration [s]
-  N: 10000  # Total number of slots
+  # Temporal parameters
+  dt: 1.0e-6                    # Slot duration [seconds] (1 μs)
+  N: 10000                      # Total number of slots in a frame
 
-  # Detector properties
-  eta: 0.8  # Quantum efficiency
-  M_pixels: 16  # Parallel detector pixels
-  tau_d: 50.0e-9  # Dead time [s]
+  # Beam parameters
+  theta_b: 10.0e-6              # Beam divergence [radians] (10 μrad, 1/e² half-angle)
+  wavelength: 1550.0e-9         # Operating wavelength [meters] (C-band)
 
-  # Pointing parameters
-  theta_b: 10.0e-6  # Beam divergence half-angle [rad]
-  sigma2: 2.25e-12  # Pointing jitter variance [rad^2] (1.5 μrad)^2
-  mu: [0.0, 0.0]  # Mean pointing bias [rad]
+  # Pointing and tracking (PAT)
+  mu_x: 1.0e-6                  # True pointing bias, x-axis [radians]
+  mu_y: 0.5e-6                  # True pointing bias, y-axis [radians]
+  sigma2: 1.0e-12               # Pointing jitter variance [rad²]
 
-  # Link parameters
-  Llink: 1.0e-12  # Static link budget factor
-  hnu: 1.282e-19  # Photon energy [J]
+  # Background environment
+  r_b: 1.0                      # Nominal background rate [photons/second]
+                                # (Modified per scenario: zodiacal=0.01, earthshine=1.0, stray=10.0)
 
-  # Prior information matrix (Bayesian CRLB)
-  J_P: [[1.0e-12, 0.0, 0.0, 0.0],
-        [0.0, 1.0e-12, 0.0, 0.0],
-        [0.0, 0.0, 1.0e-10, 0.0],
-        [0.0, 0.0, 0.0, 1.0e-4]]
+  # Detector parameters
+  M_pixels: 16                  # Number of parallel SPAD pixels
+  tau_d: 50.0e-9                # Dead time per pixel [seconds] (50 ns typical for Si-SPAD)
+  quantum_efficiency: 0.5       # Detector quantum efficiency (50% @ 1550nm with InGaAs)
 
-# Hardware Platform Configurations
+  # Prior information for Bayesian CRLB (Section III.B)
+  J_P:                          # Prior Fisher information matrix J_P = Σ₀⁻¹
+    - [1.0e12, 0.0,   0.0, 0.0]  # μx prior precision
+    - [0.0,   1.0e12, 0.0, 0.0]  # μy prior precision
+    - [0.0,   0.0,   1.0e6, 0.0] # σ² prior precision (weak)
+    - [0.0,   0.0,   0.0, 1.0e-3] # r_b prior precision (very weak)
+
+# ----------------------------------------------------------------------------
+# HARDWARE PLATFORMS - Detector Technology Trade-offs
+# ----------------------------------------------------------------------------
 hardware_platforms:
-  short_deadtime:
-    dead_time: 5.0e-9  # 5 ns
-    parallel_pixels: 64
-    peak_power: 500.0
-    slot_duration: 1.0e-6
-    name: "Short τd (5ns, M=64)"
+  short_dead_time:
+    name: "Advanced Si-SPAD (Short τ_d)"
+    dead_time: 30.0e-9          # 30 ns recovery time
+    parallel_pixels: 16          # 4×4 array
+    peak_power: 100.0            # Photons/slot before saturation
+    slot_duration: 1.0e-6        # 1 μs slots
+    description: "State-of-the-art silicon SPAD with fast quenching"
 
-  long_deadtime:
-    dead_time: 50.0e-9  # 50 ns
-    parallel_pixels: 16
-    peak_power: 500.0
+  long_dead_time:
+    name: "InGaAs APD (Long τ_d)"
+    dead_time: 100.0e-9          # 100 ns recovery time
+    parallel_pixels: 4           # 2×2 array (limited by InGaAs technology)
+    peak_power: 100.0
     slot_duration: 1.0e-6
-    name: "Long τd (50ns, M=16)"
+    description: "High-sensitivity InGaAs avalanche photodiode"
 
-# Simulation Scenarios
+  multi_pixel_array:
+    name: "Massively Parallel SPAD Array"
+    dead_time: 50.0e-9
+    parallel_pixels: 64          # 8×8 array
+    peak_power: 100.0
+    slot_duration: 1.0e-6
+    description: "Large-format array for high throughput"
+
+# ----------------------------------------------------------------------------
+# SIMULATION PARAMETERS - Computational Settings
+# ----------------------------------------------------------------------------
 simulation:
   # Signal budget sweep for Figure 1
-  signal_budgets: [0.5, 2.0, 10.0, 50.0]
+  signal_budgets: [0.5, 2, 10, 50]  # Photons/slot
 
-  # Background regimes (photons/slot)
+  # Background regime definitions (Section II)
   background_regimes:
     zodiacal:
-      lambda_b: 0.01
-      name: "Zodiacal Light"
-      color: "#0072BD"
-      description: "Deep space, ecliptic poles"
-
+      lambda_b: 0.01              # Deep space
+      color: '#3498db'            # Blue
     earthshine:
-      lambda_b: 1.0
-      name: "Earthshine"
-      color: "#EDB120"
-      description: "Earth-pointing, moderate albedo"
-
+      lambda_b: 1.0               # LEO typical
+      color: '#f39c12'            # Orange
     stray_light:
-      lambda_b: 10.0
-      name: "Stray Light"
-      color: "#A2142F"
-      description: "Near-sun operations"
+      lambda_b: 10.0              # Near-sun operations
+      color: '#e74c3c'            # Red
 
-# Monte Carlo Validation Parameters
+  # Resource allocation search grids
+  alpha_range: [0.05, 0.95, 20]   # [min, max, num_points] for time allocation
+  rho_range: [0.05, 0.95, 20]     # [min, max, num_points] for photon allocation
+
+  # MSE targets for Pareto boundary tracing (Figure 3)
+  mse_targets_log: [-12, -6, 15]  # [log10(min), log10(max), num_points]
+
+# ----------------------------------------------------------------------------
+# MONTE CARLO VALIDATION - Section IV Appendix
+# ----------------------------------------------------------------------------
 monte_carlo:
-  n_trials: 1000  # Number of MC trials (reduce for faster testing)
-  confidence_level: 0.95
+  n_trials: 10000                 # Number of MC realizations
+  confidence_level: 0.95          # For error bars
 
   # Test scenarios for CRLB validation
-  test_scenarios:
+  validation_scenarios:
     - name: "Low Background"
-      Sbar: 10.0
+      Sbar: 10
       r_b: 0.1
       alpha: 0.3
       rho: 0.5
 
     - name: "Medium Background"
-      Sbar: 50.0
+      Sbar: 50
       r_b: 1.0
       alpha: 0.2
       rho: 0.6
 
     - name: "High Background"
-      Sbar: 20.0
+      Sbar: 20
       r_b: 5.0
       alpha: 0.4
       rho: 0.7
 
-# Ergodic vs Outage Analysis
-channel_analysis:
-  # Background state distribution
-  background_distribution:
-    low:
-      lambda_b: 0.01
-      probability: 0.70
-    medium:
-      lambda_b: 1.0
-      probability: 0.25
-    high:
-      lambda_b: 10.0
-      probability: 0.05
+  # MLE optimization settings
+  mle_optimizer:
+    method: "Nelder-Mead"         # Gradient-free for robustness
+    max_iterations: 200
+    tolerance: 1.0e-8
 
-  outage_probability: 0.1  # 10% outage
+# ----------------------------------------------------------------------------
+# CAPACITY COMPUTATION - Arimoto-Blahut Settings
+# ----------------------------------------------------------------------------
+capacity:
+  # Lower bound (binary input)
+  binary_input:
+    amplitude_grid_points: 100    # Grid resolution for A optimization
 
-  # Signal budget range for analysis
-  signal_range:
-    min: 0.1
-    max: 100.0
-    num_points: 30
+  # Upper bound (Arimoto-Blahut algorithm)
+  arimoto_blahut:
+    amplitude_grid_points: 50     # Reduced for speed (adaptive grid)
+    max_iterations: 1000
+    convergence_tolerance: 1.0e-6
 
-# Design Law Parameters (Figure 4)
-design_law:
-  # Sun avoidance angle range [degrees]
-  sun_angle_range:
-    min: 10
-    max: 180
-    num_points: 50
+  # Truncation for Poisson entropy
+  poisson_truncation:
+    tail_probability: 1.0e-10     # K_max chosen to capture 1-10⁻¹⁰ of mass
 
-  # Field of view range [microradians]
-  fov_range:
-    min: 20
-    max: 500
-    num_points: 40
+# ----------------------------------------------------------------------------
+# PHYSICAL BACKGROUND MODEL - Section II Integration
+# ----------------------------------------------------------------------------
+physical_model:
+  # Solar stray light (PST model)
+  solar:
+    baseline_flux: 1.0e10         # Photons/(m²·s·sr) at 1 AU
+    pst_min_angle: 10.0           # Degrees (minimum safe sun angle)
+    pst_exponent: 3.0             # PST(θ) ~ θ⁻³
 
-  # Background model parameters
-  background_model:
-    pst_min: 1.0e-10  # Minimum point source transmittance
-    pst_max: 1.0e-4   # Maximum point source transmittance
-    reference_fov: 100.0e-6  # Reference FoV [rad]
+  # Earthshine parameters
+  earthshine:
+    earth_radius_km: 6371
+    average_albedo: 0.3           # Earth's Bond albedo
+    phase_modulation: true        # Include day/night cycle
 
-# Figure Generation Settings
+  # Zodiacal light
+  zodiacal:
+    ecliptic_baseline: 0.01       # Relative to solar at 90°
+    heliocentric_variation: 0.3   # Modulation amplitude with ecliptic angle
+
+  # Orbital parameters for Earthshine computation
+  orbit:
+    altitude_km: 600              # LEO typical
+    earth_phase_angle_deg: 90     # Terminator geometry (worst case)
+
+# ----------------------------------------------------------------------------
+# ABLATION STUDY PARAMETERS - Sensitivity Analysis
+# ----------------------------------------------------------------------------
+ablation:
+  # Parameter sweep ranges
+  dither_amplitude:
+    range: [0.1, 2.0, 20]         # [min, max, num] in units of θ_b
+    baseline: 0.5                 # Nominal value
+
+  dead_time:
+    range: [10.0e-9, 200.0e-9, 20]
+    baseline: 50.0e-9
+
+  pointing_variance:
+    range: [-13, -10, 20]         # log10 scale
+    baseline: -12                 # log10(σ²) = -12
+
+  background_rate:
+    range: [-2, 1, 20]            # log10 scale
+    baseline: 0                   # log10(r_b) = 0 → r_b = 1
+
+# ----------------------------------------------------------------------------
+# FIGURE GENERATION SETTINGS
+# ----------------------------------------------------------------------------
 figures:
-  style: "ieee_single_column"
-  dpi: 300
-  format: ["pdf", "png"]
+  # Global matplotlib settings
+  style: "ieee"                   # Custom IEEE Transactions style
+  dpi: 300                        # High-resolution for publication
+  format: ["pdf", "png"]          # Save both formats
 
-  # Figure-specific parameters
-  fig1_capacity:
-    lambda_b_points: 80
-    background_range: [0.01, 100.0]
+  # Color scheme
+  colors:
+    zodiacal: '#3498db'
+    earthshine: '#f39c12'
+    stray_light: '#e74c3c'
+    lower_bound: '#2ecc71'
+    upper_bound: '#e67e22'
 
-  fig2_fim:
-    alpha_points: 25
-    rho_points: 25
-    alpha_range: [0.05, 0.95]
-    rho_range: [0.05, 0.95]
+  # Font sizes (pt)
+  fonts:
+    title: 13
+    axis_label: 12
+    tick_label: 10
+    legend: 9
+    annotation: 8
 
-  fig3_pareto:
-    alpha_points: 20
-    rho_points: 20
-    mse_targets: 15
-    probe_points: 8  # For adaptive MSE range detection
-
-  fig4_design:
-    capacity_contour_levels: [0.1, 0.5, 1.0, 2.0, 3.0, 4.0]
-
-# Validation and Testing
-validation:
-  # Parameter ranges for robustness testing
-  parameter_sweep:
-    dead_time: [5.0e-9, 20.0e-9, 50.0e-9, 100.0e-9]
-    parallel_pixels: [1, 4, 16, 64, 256]
-    beam_divergence: [5.0e-6, 10.0e-6, 20.0e-6]
-
-  # Convergence testing
-  convergence:
-    pilot_counts: [100, 500, 1000, 2000, 5000]
-    grid_resolutions: [10, 15, 20, 25, 30]
-
-# Output Organization
-output:
-  base_directory: "section_iv_results"
-  subdirectories:
-    figures: "figures"
-    data: "data"
-    validation: "validation"
-    appendix: "appendix"
-
-  # File naming convention
-  naming:
-    timestamp: true
-    parameter_suffix: true
-
-  # Data preservation
-  save_intermediate: true
-  compress_data: true
-
-# Computational Settings
+# ----------------------------------------------------------------------------
+# COMPUTATIONAL RESOURCES
+# ----------------------------------------------------------------------------
 computation:
-  # Parallel processing (if available)
-  use_multiprocessing: false
-  num_processes: 4
+  # Parallel processing
+  use_multiprocessing: true
+  num_workers: null               # null = auto-detect (cpu_count - 1)
 
   # Memory management
-  chunk_size: 1000
+  max_grid_size: 50               # Maximum dimension for 2D grids
+  chunk_size: 100                 # For parallel map operations
 
-  # Numerical tolerances
-  tolerances:
-    fim_condition_number: 1.0e30
-    regularization: 1.0e-12
-    convergence: 1.0e-10
+  # Numerical stability
+  epsilon: 1.0e-20                # Small number to avoid division by zero
+  condition_number_threshold: 1.0e30  # For FIM inversion
 
-  # Optimization settings
-  optimization:
-    max_iterations: 1000
-    grid_search_resolution: 100
+# ----------------------------------------------------------------------------
+# OUTPUT ORGANIZATION
+# ----------------------------------------------------------------------------
+output:
+  base_directory: "section_iv_results"
+
+  subdirectories:
+    figures: "figures"            # Main paper figures
+    appendix: "appendix"          # Supplementary figures
+    analysis: "analysis"          # Ablation studies
+    data: "data"                  # Numerical results (.npz)
+    validation: "validation"      # MC validation data
+
+  # File naming convention
+  figure_prefix: "Fig_"
+  appendix_prefix: "Fig_A"
+  data_prefix: "data_"
+
+  # Logging
+  log_level: "INFO"               # DEBUG, INFO, WARNING, ERROR
+  log_file: "simulation.log"
+
+# ----------------------------------------------------------------------------
+# REPRODUCIBILITY
+# ----------------------------------------------------------------------------
+reproducibility:
+  random_seed: 42                 # Global numpy seed
+  version_info: true              # Save package versions
+  git_commit: true                # Record git hash if available
+
+  # Metadata to save with results
+  metadata:
+    paper_title: "Fundamental Performance Limits of OISL-ISAC Systems"
+    authors: ["Author Names"]
+    institution: "Your Institution"
+    contact: "email@example.com"
+    date_generated: "auto"        # Timestamp added automatically
+
+# ============================================================================
+# END OF CONFIGURATION
+# ============================================================================

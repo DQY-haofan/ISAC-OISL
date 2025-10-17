@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-OISL-ISAC Performance Limits Simulation (FINAL FIXED VERSION)
-==============================================================
-
-All critical patches applied based on expert diagnosis:
-✓ Patch 1: Fixed FIM feasibility (A_pilot only)
-✓ Patch 2: Relaxed threshold (1e30) + regularization
-✓ Patch 3: Unified rate/count handling
-✓ Patch A: W matrix focuses on pointing accuracy (μx, μy only)
-✓ Patch B: Adaptive D_targets based on achievable MSE range
-
-ALL THREE FIGURES NOW GENERATE SUCCESSFULLY!
+OISL-ISAC Performance Limits Simulation (COMPLETE FIXED VERSION)
+=================================================================
+✓ Patch A: Dead-time chain rule in FIM gradients
+✓ Patch B: Adaptive A_pilot selection
+✓ All English labels (IEEE ready)
+✓ Bug fixes: Index error in Pareto computation
+✓ Output to section_III directory
 """
 
 import numpy as np
@@ -24,6 +20,7 @@ import multiprocessing as mp
 from functools import partial
 
 warnings.filterwarnings('ignore')
+
 # ============================================================================
 # CONSTANTS & STYLE
 # ============================================================================
@@ -61,7 +58,7 @@ colors = setup_ieee_style()
 
 
 # ============================================================================
-# IMPROVED POISSON ENTROPY
+# POISSON ENTROPY
 # ============================================================================
 
 def poisson_entropy(lam):
@@ -81,7 +78,7 @@ def poisson_entropy(lam):
 
 
 # ============================================================================
-# CAPACITY WITH UNIFIED RATE/COUNT HANDLING
+# CAPACITY
 # ============================================================================
 
 def capacity_lb(Sbar, Smax, lamb_b, dt=1.0, tau_d=None, M_pixels=1, verbose=False):
@@ -111,7 +108,7 @@ def capacity_lb(Sbar, Smax, lamb_b, dt=1.0, tau_d=None, M_pixels=1, verbose=Fals
         if p > 1:
             continue
 
-        # Convert to rates and apply dead time in rate domain
+        # Convert to rates and apply dead time
         r0 = lamb_b / dt
         r1 = (lamb_b + A) / dt
 
@@ -149,14 +146,11 @@ def capacity_lb(Sbar, Smax, lamb_b, dt=1.0, tau_d=None, M_pixels=1, verbose=Fals
         if I > Cbest:
             Cbest, Aopt = I, A
 
-    if verbose:
-        print(f"  ✓ C_lb={Cbest:.4f} at A={Aopt:.1f}")
-
     return Cbest, Aopt
 
 
 # ============================================================================
-# FIM WITH PROPER FEASIBILITY AND RATE HANDLING
+# POINTING LOSS
 # ============================================================================
 
 def E_Lp(mu_vec, sigma2, theta_b):
@@ -173,9 +167,63 @@ def r_deadtime(r, tau_d):
     return r / (1.0 + r * tau_d)
 
 
+# ============================================================================
+# ADAPTIVE A_PILOT SELECTION (PATCH B)
+# ============================================================================
+
+def choose_A_pilot(params, lambda_b_slot, zeta=0.25):
+    """
+    Adaptive pilot amplitude to avoid dead-time saturation
+
+    Parameters:
+    -----------
+    zeta : float
+        Target r*tau_d (0.25 is conservative for high-photon)
+    """
+    dt = params['dt']
+    tau_d = params['tau_d']
+    Smax = params['Smax']
+    M_pixels = params['M_pixels']
+    Sbar = params['Sbar']
+
+    # Effective peak
+    if tau_d:
+        Smax_eff = min(Smax, (dt / tau_d) * M_pixels)
+    else:
+        Smax_eff = Smax
+
+    # Average pointing loss
+    Lp_avg = float(E_Lp(params['mu'], params['sigma2'], params['theta_b']))
+
+    # Background rate (pre-correction)
+    r_b_pre = lambda_b_slot / dt
+
+    if tau_d:
+        # Target rate: r*tau_d = zeta
+        r_target = zeta / tau_d
+
+        # Required A
+        A_cap = max(0.0, (r_target - r_b_pre) * dt / max(Lp_avg, 1e-9))
+
+        # Conservative selection (0.6 for high-photon)
+        A_use = min(Smax_eff, max(0.1 * Sbar, 0.6 * A_cap))
+    else:
+        A_use = min(Smax_eff, 0.8 * min(4.0 * Sbar, Smax_eff))
+
+    return A_use
+
+
+# ============================================================================
+# FIM WITH DEAD-TIME CHAIN RULE (PATCH A)
+# ============================================================================
+
 def fim_pilot(alpha, rho, Sbar, N, dt, params, dither_seq, tau_d=None,
               A_pilot=None, M_pixels=1, verbose=False):
-    """FIM computation with α-ρ decoupling"""
+    """
+    FIM computation with dead-time gradient correction
+
+    KEY FIX: Include g_dead = 1/(1+r*tau_d)^2 in all gradients
+    """
     mu = params["mu"].copy()
     sigma2 = params["sigma2"]
     theta_b = params["theta_b"]
@@ -189,13 +237,13 @@ def fim_pilot(alpha, rho, Sbar, N, dt, params, dither_seq, tau_d=None,
     else:
         Smax_eff = Smax
 
-    # Choose per-slot pilot amplitude
+    # Pilot amplitude
     if A_pilot is None:
         A_pilot = min(Smax_eff, 4.0 * Sbar) * 0.5
 
     A_pilot = min(A_pilot, Smax_eff)
 
-    # Total pilot photons and slot count
+    # Pilot slot count
     S_total_pilot = rho * Sbar * N
     Npilot = int(min(
         np.floor(alpha * N),
@@ -205,7 +253,7 @@ def fim_pilot(alpha, rho, Sbar, N, dt, params, dither_seq, tau_d=None,
     if Npilot <= 0:
         return np.zeros((4, 4))
 
-    # Tile dither if needed
+    # Dither sequence
     if len(dither_seq) < Npilot:
         reps = int(np.ceil(Npilot / len(dither_seq)))
         dither_seq_used = (dither_seq * reps)[:Npilot]
@@ -223,24 +271,40 @@ def fim_pilot(alpha, rho, Sbar, N, dt, params, dither_seq, tau_d=None,
 
     for n in range(Npilot):
         mu_eff = mu + dither_seq_used[n]
-        Lp = float(E_Lp(mu_eff, sigma2, theta_b))
+        mu_eff_norm2 = np.dot(mu_eff, mu_eff)
 
-        # Convert background to rate
-        r_s = A_pilot * Lp / dt
-        r_brt = r_b / dt
-        r_tot = r_s + r_brt
+        # Pointing loss
+        Lp = (1.0 / gamma) * np.exp(-b * mu_eff_norm2 / gamma)
 
-        # Apply dead time in rate domain
+        # =====================================================================
+        # PATCH A: Dead-time chain rule correction
+        # =====================================================================
+        # Step 1: Pre-correction rates
+        r_s_pre = A_pilot * Lp / dt
+        r_b_pre = r_b / dt
+        r_pre = r_s_pre + r_b_pre
+
+        # Step 2: Apply dead-time and compute chain rule factor
         if tau_d is not None:
-            r_tot = r_deadtime(r_tot, tau_d)
+            # KEY: ∂r'/∂r = 1/(1+r*tau_d)^2
+            g_dead = 1.0 / (1.0 + r_pre * tau_d) ** 2
+            r_tot = r_pre / (1.0 + r_pre * tau_d)
+        else:
+            g_dead = 1.0
+            r_tot = r_pre
 
         lam = r_tot * dt
 
-        # Derivatives
-        dlam_dmux = A_pilot * Lp * (-2 * b * mu_eff[0] / gamma)
-        dlam_dmuy = A_pilot * Lp * (-2 * b * mu_eff[1] / gamma)
-        dlam_dsig = A_pilot * Lp * (-a / gamma + a * b * np.dot(mu_eff, mu_eff) / (gamma ** 2))
-        dlam_drb = dt
+        # Step 3: Gradients (ALL multiplied by g_dead)
+        dLp_dmux = Lp * (-2 * b * mu_eff[0] / gamma)
+        dLp_dmuy = Lp * (-2 * b * mu_eff[1] / gamma)
+        dLp_dsig = Lp * (-a / gamma + a * b * mu_eff_norm2 / (gamma ** 2))
+
+        dlam_dmux = g_dead * A_pilot * dLp_dmux * dt
+        dlam_dmuy = g_dead * A_pilot * dLp_dmuy * dt
+        dlam_dsig = g_dead * A_pilot * dLp_dsig * dt
+        dlam_drb = g_dead * dt
+        # =====================================================================
 
         grad = np.array([dlam_dmux, dlam_dmuy, dlam_dsig, dlam_drb])
 
@@ -264,11 +328,11 @@ def generate_dither_sequence(N_pilot, theta_b, delta_factor=0.6):
 
 
 # ============================================================================
-# PARAMETER PRESETS (PATCH A: W MATRIX FOCUSES ON POINTING)
+# PARAMETER PRESETS
 # ============================================================================
 
 def get_preset_params(preset='moderate'):
-    """Three validated presets with PATCH A applied"""
+    """Three validated presets"""
     c = SPEED_OF_LIGHT
     h = 6.626e-34
     wavelength = 1550e-9
@@ -290,7 +354,7 @@ def get_preset_params(preset='moderate'):
             'tau_d': None,
             'M_pixels': 1,
             'J_P': np.diag([1e-11, 1e-11, 1e-9, 1e-5]),
-            'W': np.diag([1.0, 1.0, 0.0, 0.0]),  # PATCH A: Focus on μx, μy
+            'W': np.diag([1.0, 1.0, 0.0, 0.0]),
         }
         scenarios = {
             'Low': {'name': 'Zodiacal', 'r_b': 0.01, 'color': colors['zodiacal']},
@@ -313,7 +377,7 @@ def get_preset_params(preset='moderate'):
             'tau_d': 50e-9,
             'M_pixels': 16,
             'J_P': np.diag([1e-12, 1e-12, 1e-10, 1e-4]),
-            'W': np.diag([1.0, 1.0, 0.0, 0.0]),  # PATCH A: Focus on μx, μy
+            'W': np.diag([1.0, 1.0, 0.0, 0.0]),
         }
         scenarios = {
             'Low': {'name': 'Zodiacal', 'r_b': 0.05, 'color': colors['zodiacal']},
@@ -336,7 +400,7 @@ def get_preset_params(preset='moderate'):
             'tau_d': 100e-9,
             'M_pixels': 64,
             'J_P': np.diag([1e-12, 1e-12, 1e-10, 1e-4]),
-            'W': np.diag([1.0, 1.0, 0.0, 0.0]),  # PATCH A: Focus on μx, μy
+            'W': np.diag([1.0, 1.0, 0.0, 0.0]),
         }
         scenarios = {
             'Low': {'name': 'Zodiacal', 'r_b': 0.01, 'color': colors['zodiacal']},
@@ -404,11 +468,11 @@ def generate_fig_capacity_vs_background(params, output_dir='./', verbose=False):
 
 
 # ============================================================================
-# FIGURE 2: FIM VS RESOURCE
+# FIGURE 2: FIM VS RESOURCES
 # ============================================================================
 
 def generate_fig_fim_vs_resources(params, scenarios, output_dir='./', verbose=False):
-    """Generate FIM heatmap"""
+    """Generate FIM heatmap with adaptive A_pilot"""
     print("\n" + "=" * 60)
     print("Figure 2: FIM vs Resources")
     print("=" * 60)
@@ -424,11 +488,20 @@ def generate_fig_fim_vs_resources(params, scenarios, output_dir='./', verbose=Fa
     max_pilots = int(0.95 * params['N'])
     dither_seq = generate_dither_sequence(max_pilots, params['theta_b'])
 
+    # Adaptive A_pilot
+    A_pilot_use = choose_A_pilot(params, scenario['r_b'], zeta=0.25)
+    print(f"Adaptive A_pilot = {A_pilot_use:.2f} photons/slot")
+
+    # Diagnostic
+    if params['tau_d']:
+        r_test = (scenario['r_b'] + A_pilot_use * 0.5) / params['dt']
+        saturation = r_test * params['tau_d']
+        print(f"Estimated r*tau_d ≈ {saturation:.3f} (target < 0.5)")
+
     print(f"Computing FIM grid (25×25)...")
 
     valid_count = 0
 
-    # Effective peak
     if params['tau_d']:
         Smax_eff = min(params['Smax'],
                        (params['dt'] / params['tau_d']) * params['M_pixels'])
@@ -438,9 +511,6 @@ def generate_fig_fim_vs_resources(params, scenarios, output_dir='./', verbose=Fa
     for i, rho in enumerate(tqdm(rho_range, desc="ρ sweep")):
         for j, alpha in enumerate(alpha_range):
             try:
-                A_pilot_use = min(Smax_eff, 4.0 * params['Sbar']) * 0.8
-                A_pilot_use = min(A_pilot_use, Smax_eff)
-
                 I_pilot = fim_pilot(alpha, rho, params['Sbar'], params['N'],
                                     params['dt'], params_sim, dither_seq,
                                     params['tau_d'], A_pilot_use, params['M_pixels'])
@@ -460,12 +530,24 @@ def generate_fig_fim_vs_resources(params, scenarios, output_dir='./', verbose=Fa
 
     print(f"✓ Valid points: {valid_count}/{mse_trace.size} ({valid_count / mse_trace.size * 100:.1f}%)")
 
-    # Robust plotting
+    # Diagnostics
     valid = np.isfinite(mse_trace) & (mse_trace > 0)
 
     if valid.sum() < 0.05 * mse_trace.size:
         print("⚠ Too few valid points")
         return None, None, None
+
+    mse_valid = mse_trace[valid]
+    mse_min, mse_max = mse_valid.min(), mse_valid.max()
+    mse_ratio = mse_max / mse_min
+    mse_std = np.std(np.log10(mse_valid))
+
+    print(f"✓ MSE range: [{mse_min:.3e}, {mse_max:.3e}]")
+    print(f"✓ MSE ratio: {mse_ratio:.2e} (should be >> 1)")
+    print(f"✓ log₁₀(MSE) std: {mse_std:.3f} (should be > 0.1)")
+
+    if mse_ratio < 10:
+        print("⚠ WARNING: MSE has narrow range!")
 
     vmin = np.percentile(mse_trace[valid], 5)
     vmax = np.percentile(mse_trace[valid], 95)
@@ -507,62 +589,50 @@ def generate_fig_fim_vs_resources(params, scenarios, output_dir='./', verbose=Fa
 
 
 # ============================================================================
-# FIGURE 3: PARETO BOUNDARY (PATCH B: ADAPTIVE D_TARGETS)
+# FIGURE 3: PARETO BOUNDARY
 # ============================================================================
 
 def _compute_pareto_point_worker(args):
-    """
-    Worker function for parallel Pareto point computation
-
-    This function is designed to be pickled for multiprocessing.
-    All necessary data is passed through args tuple.
-    """
+    """Worker for parallel Pareto computation"""
     (D_max, alpha_search, rho_search, params, params_sim,
      dither_seq, Smax_eff, scenario_r_b) = args
 
     max_rate = 0.0
     best_alpha, best_rho = 0, 0
 
+    A_pilot_use = choose_A_pilot(params, scenario_r_b, zeta=0.25)
+
     for alpha in alpha_search:
         for rho in rho_search:
             try:
-                # Compute A_pilot_use
-                A_pilot_use = min(Smax_eff, 4.0 * params['Sbar']) * 0.8
-                A_pilot_use = min(A_pilot_use, Smax_eff)
+                if alpha >= 0.99:  # Relaxed from 1.0 to allow more extreme cases
+                    continue
 
-                # Data signal
                 S_data = (1 - rho) * params['Sbar'] / (1 - alpha)
 
-                # Compute FIM
                 I_pilot = fim_pilot(
                     alpha, rho, params['Sbar'], params['N'],
                     params['dt'], params_sim, dither_seq,
                     params['tau_d'], A_pilot_use, params['M_pixels']
                 )
 
-                # Regularization
                 J = I_pilot + params['J_P'] + 1e-12 * np.eye(4)
 
-                # Check condition number
                 if np.linalg.cond(J) > 1e30:
                     continue
 
-                # Compute MSE
                 J_inv = np.linalg.inv(J)
                 mse_current = np.trace(params['W'] @ J_inv)
 
-                # Check MSE constraint
                 if mse_current > D_max:
                     continue
 
-                # Compute achievable rate
                 C_data, _ = capacity_lb(
                     S_data, params['Smax'], scenario_r_b,
                     params['dt'], params['tau_d'], params['M_pixels']
                 )
                 rate = (1 - alpha) * C_data
 
-                # Update best
                 if rate > max_rate:
                     max_rate = rate
                     best_alpha, best_rho = alpha, rho
@@ -575,39 +645,23 @@ def _compute_pareto_point_worker(args):
 
 def generate_fig_pareto_boundary(params, scenarios, output_dir='./',
                                  verbose=False, n_workers=None):
-    """
-    Generate Pareto boundary with PATCH B: Adaptive D_targets
-
-    ** PARALLEL VERSION **
-
-    Parameters:
-    -----------
-    n_workers : int or None
-        Number of parallel workers. If None, uses (CPU_count - 1).
-        Set to 1 to disable parallelization.
-    """
+    """Generate Pareto boundary"""
     print("\n" + "=" * 60)
-    print("Figure 3: Rate-MSE Pareto (PATCH B: Adaptive + PARALLEL)")
+    print("Figure 3: Rate-MSE Pareto (Enhanced)")
     print("=" * 60)
 
-    # Determine number of workers
     if n_workers is None:
         n_workers = max(1, mp.cpu_count() - 1)
-    n_workers = max(1, n_workers)  # At least 1 worker
+    n_workers = max(1, n_workers)
 
     print(f"🚀 Using {n_workers} parallel worker(s)")
-    print(f"   Available CPU cores: {mp.cpu_count()}")
 
-    # ========================================================================
-    # PHASE 1: Probe achievable MSE range (Sequential - Fast)
-    # ========================================================================
-
-    alpha_probe = np.linspace(0.1, 0.9, 10)
-    rho_probe = np.linspace(0.1, 0.9, 10)
+    # Phase 1: Probe MSE range (extended for high-noise)
+    alpha_probe = np.linspace(0.05, 0.95, 12)  # Include extreme allocations
+    rho_probe = np.linspace(0.05, 0.95, 12)
     max_pilots = int(0.9 * params['N'])
     dither_seq = generate_dither_sequence(max_pilots, params['theta_b'])
 
-    # Probe with Medium scenario
     probe = scenarios['Medium']
     params_probe = params.copy()
     params_probe['r_b'] = probe['r_b']
@@ -620,15 +674,15 @@ def generate_fig_pareto_boundary(params, scenarios, output_dir='./',
     else:
         Smax_eff = params['Smax']
 
-    A_pilot_use = min(Smax_eff, 4.0 * params['Sbar']) * 0.8
+    A_pilot_probe = choose_A_pilot(params, probe['r_b'], zeta=0.25)
 
-    print("Probing achievable MSE range...")
+    print(f"Probing MSE range (A_pilot={A_pilot_probe:.2f})...")
     for alpha in alpha_probe:
         for rho in rho_probe:
             try:
                 I_pilot = fim_pilot(alpha, rho, params['Sbar'], params['N'], params['dt'],
                                     params_probe, dither_seq, params['tau_d'],
-                                    A_pilot_use, params['M_pixels'])
+                                    A_pilot_probe, params['M_pixels'])
                 J = I_pilot + params['J_P'] + 1e-12 * np.eye(4)
                 if np.linalg.cond(J) < 1e30:
                     mse = np.trace(params['W'] @ np.linalg.inv(J))
@@ -638,20 +692,18 @@ def generate_fig_pareto_boundary(params, scenarios, output_dir='./',
                 pass
 
     if len(mse_samples) == 0:
-        print("⚠️  No valid MSE samples, using fallback range")
-        D_targets = np.logspace(-6, -2, 12)
+        print("⚠️ No valid MSE samples, using fallback")
+        D_targets = np.logspace(-15, -8, 18)  # Extended range
     else:
         mmin, mmed, mmax = np.percentile(mse_samples, [5, 50, 95])
-        D_targets = np.logspace(np.log10(mmin * 0.8), np.log10(mmax * 1.2), 12)
-        print(f"✅ Adaptive MSE range: [{mmin:.3e}, {mmax:.3e}]")
+        # Enhanced: Much wider range for high-noise scenarios
+        D_targets = np.logspace(np.log10(mmin * 0.3), np.log10(mmax * 50.0), 18)
+        print(f"✅ MSE samples: min={mmin:.3e}, med={mmed:.3e}, max={mmax:.3e}")
         print(f"   D_targets: [{D_targets[0]:.3e}, {D_targets[-1]:.3e}]")
 
-    # ========================================================================
-    # PHASE 2: Compute Pareto boundary (PARALLEL)
-    # ========================================================================
-
-    alpha_search = np.linspace(0.05, 0.95, 19)
-    rho_search = np.linspace(0.05, 0.95, 19)
+    # Phase 2: Compute Pareto (extended range for high-noise)
+    alpha_search = np.linspace(0.02, 0.98, 25)  # Allow extreme allocations
+    rho_search = np.linspace(0.05, 0.95, 20)
 
     pareto_results = {}
 
@@ -663,42 +715,41 @@ def generate_fig_pareto_boundary(params, scenarios, output_dir='./',
         params_sim = params.copy()
         params_sim['r_b'] = scenario['r_b']
 
-        # Prepare arguments for parallel workers
         worker_args = [
             (D_max, alpha_search, rho_search, params, params_sim,
              dither_seq, Smax_eff, scenario['r_b'])
             for D_max in D_targets
         ]
 
-        # Execute in parallel
         if n_workers > 1:
-            print(f"🔄 Parallel computation with {n_workers} workers...")
+            print(f"🔄 Parallel computation...")
             with mp.Pool(n_workers) as pool:
-                # Use imap for progress tracking
                 results = list(tqdm(
                     pool.imap(_compute_pareto_point_worker, worker_args),
                     total=len(D_targets),
                     desc=f"  {scenario_name}"
                 ))
         else:
-            print(f"🔄 Sequential computation (single worker)...")
+            print(f"🔄 Sequential computation...")
             results = [
                 _compute_pareto_point_worker(args)
                 for args in tqdm(worker_args, desc=f"  {scenario_name}")
             ]
 
-        # Filter valid results
+        # Filter valid - FIX: Correct unpacking
         pareto_points = [r for r in results if r is not None]
         pareto_results[scenario_name] = [
             (rate, D_max) for (rate, D_max, _, _) in pareto_points
         ]
 
-        print(f"✅ Found {len(pareto_points)}/{len(D_targets)} valid Pareto points")
+        print(f"✅ Found {len(pareto_points)}/{len(D_targets)} valid points")
 
-    # ========================================================================
-    # PHASE 3: Plot results (Sequential - Fast)
-    # ========================================================================
+        # FIX: Correct unpacking for diagnostics
+        if len(pareto_points) > 0:
+            rates = [p[0] for p in pareto_points]  # p is (rate, D_max, alpha, rho)
+            print(f"   Rate range: [{min(rates):.4f}, {max(rates):.4f}] bits/slot")
 
+    # Phase 3: Plot
     print(f"\n{'=' * 60}")
     print("📊 Generating plot...")
     print(f"{'=' * 60}")
@@ -711,7 +762,6 @@ def generate_fig_pareto_boundary(params, scenarios, output_dir='./',
             rates = [p[0] for p in points]
             mses = [p[1] for p in points]
 
-            # Sort by MSE for proper plotting
             sorted_pairs = sorted(zip(mses, rates))
             mses_sorted = [p[0] for p in sorted_pairs]
             rates_sorted = [p[1] for p in sorted_pairs]
@@ -720,7 +770,7 @@ def generate_fig_pareto_boundary(params, scenarios, output_dir='./',
                       color=scenario['color'], linewidth=2, markersize=5,
                       label=scenario["name"])
         else:
-            print(f"⚠️  No valid points for {scenario_name}")
+            print(f"⚠️ No valid points for {scenario_name}")
 
     ax.set_xlabel('MSE (μx, μy) [rad²]', fontsize=10, weight='bold')
     ax.set_ylabel('Rate [bits/slot]', fontsize=10, weight='bold')
@@ -739,44 +789,58 @@ def generate_fig_pareto_boundary(params, scenarios, output_dir='./',
 
 
 # ============================================================================
-# MAIN DRIVER
+# MAIN
 # ============================================================================
 
 def main(preset='moderate'):
-    """Main with all patches applied"""
+    """Main function"""
     print("\n" + "=" * 80)
-    print("OISL-ISAC SIMULATION (FINAL - ALL PATCHES)")
-    print("✓ Patch A: W matrix focuses on pointing (μx, μy)")
-    print("✓ Patch B: Adaptive D_targets based on achievable MSE")
+    print("OISL-ISAC SIMULATION (COMPLETE FIX)")
+    print("✓ Patch A: Dead-time chain rule g_dead=1/(1+rτ)²")
+    print("✓ Patch B: Adaptive A_pilot with zeta=0.25")
+    print("✓ Enhanced D_targets range")
+    print("✓ All labels in English (IEEE ready)")
     print("=" * 80)
 
     params, scenarios = get_preset_params(preset)
 
     print(f"\n✓ Preset: '{preset}'")
     print(f"  S̄={params['Sbar']:.1f}, M={params['M_pixels']}")
-    print(f"  W matrix: Focuses on pointing accuracy (μx, μy)")
 
-    output_dir = f'./results_{preset}'
+    if params['tau_d'] and params['Sbar'] > 30:
+        print(f"  ⚠️ HIGH-PHOTON mode detected")
+
+    output_dir = f'./section_III/results_{preset}'
     os.makedirs(output_dir, exist_ok=True)
+    print(f"  Output: {output_dir}")
 
     try:
         # Figure 1
         rb_array, capacity_values = generate_fig_capacity_vs_background(
             params, output_dir)
 
+        cap_diffs = np.diff(capacity_values)
+        if np.all(cap_diffs <= 1e-6):
+            print("✓ Unit test PASSED: Capacity monotonic")
+
         # Figure 2
         alpha_range, rho_range, mse_trace = generate_fig_fim_vs_resources(
             params, scenarios, output_dir)
 
-        # Figure 3 (with adaptive D_targets)
+        # Figure 3
         if mse_trace is not None:
+            valid_mse = mse_trace[np.isfinite(mse_trace)]
+            if len(valid_mse) > 0:
+                mse_ratio = valid_mse.max() / valid_mse.min()
+                print(f"✓ MSE dynamic range: {mse_ratio:.2e}")
+
             pareto_results = generate_fig_pareto_boundary(
                 params, scenarios, output_dir)
 
         print(f"\n{'=' * 80}")
-        print(f"✓✓✓ ALL THREE FIGURES GENERATED SUCCESSFULLY! ✓✓✓")
+        print(f"✓✓✓ ALL FIGURES GENERATED ✓✓✓")
         print(f"{'=' * 80}")
-        print(f"Results in: {output_dir}/")
+        print(f"Results: {output_dir}/")
 
         for f in sorted(os.listdir(output_dir)):
             print(f"  • {f}")
@@ -794,31 +858,19 @@ if __name__ == "__main__":
     import sys
     import time
 
-    # 检查命令行参数
     if len(sys.argv) > 1:
-        # 单个预设模式（保留原有功能）
         preset = sys.argv[1]
-
         if preset == 'all':
-            # 运行所有预设
             presets_to_run = ['low_photon', 'moderate', 'high_photon']
         elif preset in ['low_photon', 'moderate', 'high_photon']:
             presets_to_run = [preset]
         else:
             print(f"❌ Invalid preset: {preset}")
-            print("Available options:")
-            print("  - low_photon")
-            print("  - moderate")
-            print("  - high_photon")
-            print("  - all         (run all three presets)")
             sys.exit(1)
     else:
-        # 默认运行所有预设
-        print("ℹ️  No preset specified, running ALL presets by default")
-        print("   (Use 'python main_simulation.py <preset>' to run a specific one)")
+        print("ℹ️ Running ALL presets by default")
         presets_to_run = ['low_photon', 'moderate', 'high_photon']
 
-    # 运行所有选定的预设
     print("\n" + "=" * 80)
     print(f"🚀 RUNNING {len(presets_to_run)} PRESET(S)")
     print("=" * 80)
@@ -835,10 +887,7 @@ if __name__ == "__main__":
         success = main(preset)
         elapsed = time.time() - start_time
 
-        results[preset] = {
-            'success': success,
-            'time': elapsed
-        }
+        results[preset] = {'success': success, 'time': elapsed}
 
         print(f"\n{'=' * 80}")
         if success:
@@ -847,7 +896,6 @@ if __name__ == "__main__":
             print(f"❌ [{i}/{len(presets_to_run)}] {preset.upper()} FAILED after {elapsed:.1f}s")
         print(f"{'=' * 80}")
 
-    # 总结报告
     total_elapsed = time.time() - total_start
     print("\n" + "=" * 80)
     print("📋 EXECUTION SUMMARY")
@@ -859,10 +907,8 @@ if __name__ == "__main__":
 
     print(f"\n  Total time: {total_elapsed:.1f}s ({total_elapsed / 60:.1f} min)")
 
-    # 统计成功率
     success_count = sum(1 for r in results.values() if r['success'])
     print(f"  Success rate: {success_count}/{len(results)}")
 
-    # 退出状态
     all_success = all(r['success'] for r in results.values())
     exit(0 if all_success else 1)
