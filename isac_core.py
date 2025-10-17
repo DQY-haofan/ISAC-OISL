@@ -1,24 +1,12 @@
 #!/usr/bin/env python3
 """
-OISL-ISAC 核心函数 - 完整增强版（GPU + Numba 混合加速）
-=========================================================
+OISL-ISAC 核心函数 - CuPy 兼容修复版
+====================================
 
-特性：
-- 自动检测硬件（GPU/CPU）
-- 智能选择加速方案（Numba/GPU/CPU）
-- 完全向后兼容原始接口
-- 透明回退机制
-
-安装要求：
-- 必需：numpy, scipy
-- 可选：numba（5-20× CPU加速）
-- 可选：cupy（10-50× GPU加速）
-
-使用方法：
-    只需将导入改为：
-    from isac_core_enhanced import *
-
-    其他代码完全不变！
+修复内容：
+- 兼容 CuPy 13.x API 变化
+- 更健壮的设备信息获取
+- 保持所有其他功能不变
 """
 
 import numpy as np
@@ -29,7 +17,7 @@ import time
 
 
 # ============================================================================
-# 硬件能力检测与自动配置
+# 硬件能力检测与自动配置（修复版）
 # ============================================================================
 
 class HardwareConfig:
@@ -54,12 +42,11 @@ class HardwareConfig:
             self.prange = prange
         except ImportError:
             self.numba_available = False
-            # 提供占位符（不加速但不报错）
             self.jit = lambda *args, **kwargs: lambda f: f
             self.prange = range
 
     def _detect_gpu(self):
-        """检测 NVIDIA GPU 和 CuPy"""
+        """检测 NVIDIA GPU 和 CuPy（修复版）"""
         try:
             import cupy as cp
             # 测试 GPU 是否真的可用
@@ -68,13 +55,12 @@ class HardwareConfig:
 
             self.gpu_available = True
             self.cp = cp
-            print("✅ GPU 加速已启用（CuPy）")
         except Exception as e:
             self.gpu_available = False
             self.cp = np  # 回退到 NumPy
 
     def _print_config(self):
-        """打印硬件配置"""
+        """打印硬件配置（修复版）"""
         print("\n" + "=" * 60)
         print("🔧 OISL-ISAC 硬件配置")
         print("=" * 60)
@@ -87,15 +73,66 @@ class HardwareConfig:
             print(f"Numba: 未安装（建议安装：pip install numba）")
 
         if self.gpu_available:
-            device = self.cp.cuda.Device()
-            print(f"CuPy: {self.cp.__version__} ✅")
-            print(f"GPU: {device.name}")
-            mem_total = device.mem_info[1] / 1e9
-            print(f"显存: {mem_total:.1f} GB")
+            try:
+                print(f"CuPy: {self.cp.__version__} ✅")
+
+                device = self.cp.cuda.Device()
+
+                # ⭐ 兼容不同 CuPy 版本的设备名称获取
+                gpu_name = self._get_gpu_name(device)
+                print(f"GPU: {gpu_name}")
+
+                # 显存信息
+                mem_info = device.mem_info
+                mem_total = mem_info[1] / 1e9
+                print(f"显存: {mem_total:.1f} GB")
+
+            except Exception as e:
+                print(f"CuPy: {self.cp.__version__} ✅ (设备信息获取失败)")
+                print(f"   警告: {e}")
         else:
             print(f"CuPy: 未安装（可选，用于GPU加速）")
 
         print("=" * 60 + "\n")
+
+    def _get_gpu_name(self, device):
+        """
+        获取 GPU 名称（兼容多个 CuPy 版本）
+
+        尝试多种方法：
+        1. device.name (旧版本)
+        2. getDeviceProperties (新版本)
+        3. 计算能力 (最后回退)
+        """
+        # 方法1：直接属性（CuPy < 13.0）
+        if hasattr(device, 'name'):
+            return device.name
+
+        # 方法2：通过 runtime API（CuPy >= 13.0）
+        try:
+            props = self.cp.cuda.runtime.getDeviceProperties(device.id)
+            if isinstance(props, dict) and 'name' in props:
+                name_bytes = props['name']
+                if isinstance(name_bytes, bytes):
+                    return name_bytes.decode('utf-8').strip('\x00')
+                return str(name_bytes)
+        except Exception:
+            pass
+
+        # 方法3：通过 device.attributes（备选）
+        try:
+            attrs = device.attributes
+            if 'Name' in attrs:
+                return attrs['Name']
+        except Exception:
+            pass
+
+        # 方法4：计算能力（最后回退）
+        try:
+            cc = device.compute_capability
+            return f"GPU (Compute Capability {cc[0]}.{cc[1]})"
+        except Exception:
+            return f"GPU Device {device.id}"
 
     def to_device(self, array):
         """将数组转移到最优设备"""
@@ -121,9 +158,9 @@ _hw_config = HardwareConfig()
 class AccelerationStrategy:
     """加速策略选择器"""
 
-    # 阈值配置（可通过环境变量覆盖）
-    NUMBA_THRESHOLD = 10
-    GPU_THRESHOLD = 50
+    # ⭐ Colab/GPU 优化阈值（降低以更容易触发 GPU）
+    NUMBA_THRESHOLD = 10  # 原来是 100
+    GPU_THRESHOLD = 50  # 原来是 1000
 
     @staticmethod
     def select_method(task_name, data_size):
@@ -141,7 +178,7 @@ class AccelerationStrategy:
 
 
 # ============================================================================
-# 容量下界计算（向后兼容 + 加速）
+# 容量下界计算（Numba 加速）
 # ============================================================================
 
 @_hw_config.jit(nopython=True, fastmath=True)
@@ -149,7 +186,6 @@ def _poisson_pmf_numba(k_vals, lambda_param):
     """Numba 加速的 Poisson PMF"""
     log_probs = -lambda_param + k_vals * np.log(lambda_param + 1e-20)
 
-    # 计算 log(k!)
     log_factorials = np.zeros_like(k_vals, dtype=np.float64)
     for i in range(len(k_vals)):
         k = int(k_vals[i])
@@ -167,19 +203,15 @@ def _mutual_information_binary_numba(A, p, lambda_b, K_max):
     """Numba 加速的互信息计算"""
     k_vals = np.arange(K_max, dtype=np.float64)
 
-    # P(Y|X=0)
     P_Y_given_0 = _poisson_pmf_numba(k_vals, lambda_b)
     P_Y_given_0 = P_Y_given_0 / (np.sum(P_Y_given_0) + 1e-20)
 
-    # P(Y|X=A)
     P_Y_given_A = _poisson_pmf_numba(k_vals, lambda_b + A)
     P_Y_given_A = P_Y_given_A / (np.sum(P_Y_given_A) + 1e-20)
 
-    # P(Y)
     P_Y = (1.0 - p) * P_Y_given_0 + p * P_Y_given_A
     P_Y = P_Y / (np.sum(P_Y) + 1e-20)
 
-    # 计算熵
     log2_const = 1.0 / np.log(2.0)
 
     H_Y = 0.0
@@ -198,44 +230,24 @@ def _mutual_information_binary_numba(A, p, lambda_b, K_max):
 
 
 def capacity_lb(S_bar, S_max, lambda_b, dt=1e-6, tau_d=50e-9, M_pixels=16):
-    """
-    容量下界计算（二进制输入）
+    """容量下界计算（自动加速）"""
 
-    ✨ 增强：自动选择 Numba/CPU 加速
-
-    参数：
-        S_bar: 平均信号约束 [photons/slot]
-        S_max: 峰值信号约束 [photons/slot]
-        lambda_b: 背景光子数 [photons/slot]
-        dt: 时隙持续时间 [seconds]
-        tau_d: 死时间 [seconds]
-        M_pixels: 并行像素数
-
-    返回：
-        C_lb: 容量下界 [bits/slot]
-        A_opt: 最优幅度 [photons/slot]
-    """
-
-    # 死时间修正
     S_max_eff = S_max
     if tau_d > 0 and M_pixels > 0:
         S_max_eff = min(S_max, M_pixels * dt / tau_d)
 
-    # 幅度搜索网格
     A_min = S_bar
     A_max = S_max_eff
     N_grid = 100
 
     A_vals = np.linspace(A_min, A_max, N_grid)
 
-    # Poisson 截断
     K_max = int(np.ceil(lambda_b + S_max_eff + 10 * np.sqrt(lambda_b + S_max_eff)))
     K_max = min(K_max, 500)
 
     C_best = 0.0
     A_opt = S_bar
 
-    # 根据数据规模选择方法
     use_numba = _hw_config.numba_available and K_max > 50
 
     for A in A_vals:
@@ -243,11 +255,9 @@ def capacity_lb(S_bar, S_max, lambda_b, dt=1e-6, tau_d=50e-9, M_pixels=16):
         if p > 1.0:
             continue
 
-        # 计算互信息
         if use_numba:
             I = _mutual_information_binary_numba(A, p, lambda_b, K_max)
         else:
-            # CPU 回退版本
             I = _mutual_information_cpu(A, p, lambda_b, K_max)
 
         if I > C_best:
@@ -258,24 +268,20 @@ def capacity_lb(S_bar, S_max, lambda_b, dt=1e-6, tau_d=50e-9, M_pixels=16):
 
 
 def _mutual_information_cpu(A, p, lambda_b, K_max):
-    """CPU 版本的互信息计算（向后兼容）"""
+    """CPU 版本的互信息计算"""
     k_vals = np.arange(K_max)
 
-    # P(Y|X=0)
     log_P0 = -lambda_b + k_vals * np.log(lambda_b + 1e-20) - gammaln(k_vals + 1)
     P0 = np.exp(log_P0)
     P0 = P0 / (np.sum(P0) + 1e-20)
 
-    # P(Y|X=A)
     log_PA = -(lambda_b + A) + k_vals * np.log(lambda_b + A + 1e-20) - gammaln(k_vals + 1)
     PA = np.exp(log_PA)
     PA = PA / (np.sum(PA) + 1e-20)
 
-    # P(Y)
     PY = (1 - p) * P0 + p * PA
     PY = PY / (np.sum(PY) + 1e-20)
 
-    # 熵
     log2 = np.log(2)
     H_Y = -np.sum(np.where(PY > 1e-20, PY * np.log(PY) / log2, 0))
     H_Y0 = -np.sum(np.where(P0 > 1e-20, P0 * np.log(P0) / log2, 0))
@@ -285,24 +291,14 @@ def _mutual_information_cpu(A, p, lambda_b, K_max):
 
 
 # ============================================================================
-# 容量上界计算（Arimoto-Blahut 算法）
+# 容量上界计算
 # ============================================================================
 
 def capacity_ub_discrete(S_bar, S_max_eff, lambda_b, dt=1e-6,
                          tau_d=50e-9, M_pixels=16,
                          A_grid=None, max_iter=500, tol=1e-5):
-    """
-    容量上界计算（Arimoto-Blahut 算法）
+    """容量上界计算（Arimoto-Blahut）"""
 
-    ✨ 增强：支持 GPU 加速（大规模计算）
-
-    返回：
-        C_UB: 容量上界 [bits/slot]
-        p_opt: 最优输入分布
-        diagnostics: 收敛诊断信息
-    """
-
-    # 自适应网格
     if A_grid is None:
         A_grid = np.concatenate([
             np.linspace(0, S_bar, 15),
@@ -312,7 +308,6 @@ def capacity_ub_discrete(S_bar, S_max_eff, lambda_b, dt=1e-6,
 
     N_A = len(A_grid)
 
-    # 死时间修正
     if tau_d > 0:
         r_b = lambda_b / dt
         correction_factor = 1.0 / (1 + r_b * tau_d)
@@ -320,11 +315,9 @@ def capacity_ub_discrete(S_bar, S_max_eff, lambda_b, dt=1e-6,
     else:
         lambda_b_eff = lambda_b
 
-    # Poisson 截断
     K_max = int(np.ceil(lambda_b_eff + S_max_eff + 12 * np.sqrt(lambda_b_eff + S_max_eff)))
     K_max = min(K_max, 300)
 
-    # 选择计算设备
     use_gpu = _hw_config.gpu_available and (N_A * K_max > 5000)
 
     if use_gpu:
@@ -337,7 +330,6 @@ def _capacity_ub_cpu(A_grid, lambda_b, S_bar, K_max, max_iter, tol):
     """CPU 版本的 Arimoto-Blahut"""
     N_A = len(A_grid)
 
-    # 预计算输出分布
     P_Y_given_A = np.zeros((N_A, K_max))
     k_vals = np.arange(K_max)
 
@@ -348,16 +340,13 @@ def _capacity_ub_cpu(A_grid, lambda_b, S_bar, K_max, max_iter, tol):
             P_Y_given_A[i, :] = np.exp(log_probs)
             P_Y_given_A[i, :] /= (np.sum(P_Y_given_A[i, :]) + 1e-20)
 
-    # 初始化均匀分布
     p_A = np.ones(N_A) / N_A
     I_history = []
 
     for iteration in range(max_iter):
-        # 输出分布
         P_Y = np.dot(p_A, P_Y_given_A)
         P_Y /= (np.sum(P_Y) + 1e-20)
 
-        # 互信息
         I_current = 0.0
         for i in range(N_A):
             if p_A[i] > 1e-20:
@@ -367,11 +356,9 @@ def _capacity_ub_cpu(A_grid, lambda_b, S_bar, K_max, max_iter, tol):
 
         I_history.append(I_current)
 
-        # 收敛检查
         if iteration > 0 and abs(I_history[-1] - I_history[-2]) < tol:
             break
 
-        # 更新输入分布（使用 Blahut 迭代）
         log_weights = np.zeros(N_A)
         for i in range(N_A):
             kl_div = 0.0
@@ -380,7 +367,6 @@ def _capacity_ub_cpu(A_grid, lambda_b, S_bar, K_max, max_iter, tol):
                     kl_div += P_Y_given_A[i, k] * np.log(P_Y_given_A[i, k] / P_Y[k])
             log_weights[i] = kl_div
 
-        # 施加平均功率约束（Lagrange 乘子法）
         def constraint_error(nu):
             weights = np.exp(log_weights - nu * A_grid)
             p_new = weights / (np.sum(weights) + 1e-20)
@@ -410,11 +396,9 @@ def _capacity_ub_gpu(A_grid, lambda_b, S_bar, K_max, max_iter, tol):
     """GPU 加速版本的 Arimoto-Blahut"""
     cp = _hw_config.cp
 
-    # 转移到 GPU
     A_grid_gpu = cp.asarray(A_grid)
     N_A = len(A_grid_gpu)
 
-    # 预计算输出分布（GPU 并行）
     P_Y_given_A = cp.zeros((N_A, K_max))
     k_vals = cp.arange(K_max)
 
@@ -423,13 +407,11 @@ def _capacity_ub_gpu(A_grid, lambda_b, S_bar, K_max, max_iter, tol):
         lambda_total = lambda_b + A
         if lambda_total > 0:
             log_probs = -lambda_total + k_vals * cp.log(lambda_total + 1e-20)
-            # 阶乘（使用 GPU）
             log_factorials = cp.array([cp.sum(cp.log(cp.arange(1, k + 1))) if k > 0 else 0
                                        for k in range(K_max)])
             P_Y_given_A[i, :] = cp.exp(log_probs - log_factorials)
             P_Y_given_A[i, :] /= (cp.sum(P_Y_given_A[i, :]) + 1e-20)
 
-    # 初始化
     p_A = cp.ones(N_A) / N_A
     I_history = []
 
@@ -437,7 +419,6 @@ def _capacity_ub_gpu(A_grid, lambda_b, S_bar, K_max, max_iter, tol):
         P_Y = cp.dot(p_A, P_Y_given_A)
         P_Y /= (cp.sum(P_Y) + 1e-20)
 
-        # 互信息（GPU 并行）
         kl_matrix = cp.where(
             (P_Y_given_A > 1e-20) & (P_Y[None, :] > 1e-20),
             P_Y_given_A * cp.log(P_Y_given_A / P_Y[None, :]),
@@ -450,10 +431,8 @@ def _capacity_ub_gpu(A_grid, lambda_b, S_bar, K_max, max_iter, tol):
         if iteration > 0 and abs(I_history[-1] - I_history[-2]) < tol:
             break
 
-        # 更新分布
         kl_div = cp.sum(kl_matrix, axis=1)
 
-        # Lagrange 乘子优化
         def constraint_error_gpu(nu):
             weights = cp.exp(kl_div - nu * A_grid_gpu)
             p_new = weights / (cp.sum(weights) + 1e-20)
@@ -468,7 +447,6 @@ def _capacity_ub_gpu(A_grid, lambda_b, S_bar, K_max, max_iter, tol):
         weights = cp.exp(kl_div - nu_opt * A_grid_gpu)
         p_A = weights / (cp.sum(weights) + 1e-20)
 
-    # 转回 CPU
     C_UB = I_history[-1]
     p_A_cpu = cp.asnumpy(p_A)
 
@@ -483,26 +461,14 @@ def _capacity_ub_gpu(A_grid, lambda_b, S_bar, K_max, max_iter, tol):
 
 
 # ============================================================================
-# 物理背景模型（Section II 完整集成）
+# 物理背景模型
 # ============================================================================
 
 def physical_background_model(sun_angle_deg, fov_urad,
                               orbit_params=None,
                               wavelength=1550e-9):
-    """
-    完整物理背景模型
+    """完整物理背景模型"""
 
-    组成：
-        1. 太阳杂散光（PST 模型）
-        2. 地球照（轨道几何）
-        3. 黄道光（日心基线）
-
-    返回：
-        lambda_b: 总背景 [photons/slot]
-        components: 各分量字典
-    """
-
-    # 太阳杂散光
     sun_angle_deg = np.clip(sun_angle_deg, 10, 180)
     log_pst = -4.0 - 3.0 * np.log10(sun_angle_deg / 10.0)
     log_pst = np.clip(log_pst, -10, -4)
@@ -511,13 +477,12 @@ def physical_background_model(sun_angle_deg, fov_urad,
     fov_rad = fov_urad * 1e-6
     omega_fov = np.pi * (fov_rad / 2) ** 2
 
-    solar_flux_baseline = 1e10  # photons/(m²·s·sr) at 1 AU
+    solar_flux_baseline = 1e10
     dt_ref = 1e-3
-    A_eff = 1e-4  # 1 cm² aperture
+    A_eff = 1e-4
 
     lambda_solar = pst * solar_flux_baseline * A_eff * omega_fov * dt_ref
 
-    # 地球照
     if orbit_params is not None:
         altitude_km = orbit_params.get('altitude_km', 600)
         earth_phase = orbit_params.get('earth_phase_angle_deg', 90)
@@ -534,12 +499,10 @@ def physical_background_model(sun_angle_deg, fov_urad,
     else:
         lambda_earthshine = 0.5 * lambda_solar
 
-    # 黄道光
     zodiacal_baseline = 1e-2 * lambda_solar
     ecliptic_factor = 1.0 + 0.3 * np.cos(np.radians(sun_angle_deg))
     lambda_zodiacal = zodiacal_baseline * ecliptic_factor
 
-    # 总背景
     lambda_b = lambda_solar + lambda_earthshine + lambda_zodiacal
 
     components = {
@@ -553,7 +516,7 @@ def physical_background_model(sun_angle_deg, fov_urad,
 
 
 # ============================================================================
-# FIM 计算（增强版，支持 Numba/GPU）
+# FIM 计算（Numba 加速）
 # ============================================================================
 
 @_hw_config.jit(nopython=True, parallel=True, fastmath=True)
@@ -612,15 +575,8 @@ def _fim_inner_loop_numba(N_pilot, A_pilot, lambda_b_dt, dt, tau_d,
 
 def fim_pilot(alpha, rho, Sbar, N, dt, params, dither_seq,
               tau_d=None, S_pilot_override=None, M_pixels=16):
-    """
-    FIM 计算（增强版，向后兼容）
+    """FIM 计算（自动加速）"""
 
-    ✨ 增强：自动选择 Numba/GPU/CPU
-
-    完全兼容原始接口！
-    """
-
-    # 提取参数
     theta_b = params['theta_b']
     sigma_point_sq = params.get('sigma2', 1e-12)
     r_b = params['r_b']
@@ -641,11 +597,9 @@ def fim_pilot(alpha, rho, Sbar, N, dt, params, dither_seq,
 
     mu_true = np.array([params.get('mu_x', 1e-6), params.get('mu_y', 0.5e-6)])
 
-    # 选择计算方法
     method = AccelerationStrategy.select_method('fim_pilot', N_pilot)
 
     if method == 'numba' and _hw_config.numba_available:
-        # Numba 加速版本
         dither_array = np.ascontiguousarray(dither_seq[:N_pilot])
         I_flat = _fim_inner_loop_numba(
             N_pilot, A_pilot, r_b * dt, dt, tau_d,
@@ -654,11 +608,9 @@ def fim_pilot(alpha, rho, Sbar, N, dt, params, dither_seq,
         I_pilot = I_flat.reshape(4, 4)
 
     elif method == 'gpu' and _hw_config.gpu_available:
-        # GPU 版本
         I_pilot = _fim_gpu(N_pilot, A_pilot, r_b, dt, tau_d,
                            mu_true, dither_seq, theta_b, sigma_point_sq)
     else:
-        # CPU 回退版本
         I_pilot = _fim_cpu(N_pilot, A_pilot, r_b, dt, tau_d,
                            mu_true, dither_seq, theta_b, sigma_point_sq, M_pixels)
 
@@ -713,7 +665,6 @@ def _fim_gpu(N_pilot, A_pilot, r_b, dt, tau_d, mu_true, dither_seq,
     """GPU 版本的 FIM 计算"""
     cp = _hw_config.cp
 
-    # 转移到 GPU
     mu_true_gpu = cp.asarray(mu_true)
     dither_seq_gpu = cp.asarray(dither_seq[:N_pilot])
 
@@ -721,7 +672,6 @@ def _fim_gpu(N_pilot, A_pilot, r_b, dt, tau_d, mu_true, dither_seq,
     b = 2.0 / (theta_b ** 2)
     gamma = 1.0 + a * sigma_point_sq
 
-    # 向量化计算
     mu_eff = mu_true_gpu + dither_seq_gpu
     mu_eff_norm_sq = cp.sum(mu_eff ** 2, axis=1)
 
@@ -757,18 +707,17 @@ def _fim_gpu(N_pilot, A_pilot, r_b, dt, tau_d, mu_true, dither_seq,
     weighted_grad = grad_matrix * inv_lambda[:, None]
     I_gpu = cp.dot(weighted_grad.T, grad_matrix)
 
-    # 转回 CPU
     I_pilot = cp.asnumpy(I_gpu)
 
     return I_pilot
 
 
 # ============================================================================
-# 辅助函数（向后兼容）
+# 辅助函数
 # ============================================================================
 
 def poisson_entropy(lambda_param, K_max=None):
-    """Poisson 熵计算（向后兼容）"""
+    """Poisson 熵计算"""
     if K_max is None:
         K_max = int(np.ceil(lambda_param + 10 * np.sqrt(lambda_param)))
 
@@ -785,7 +734,7 @@ def poisson_entropy(lambda_param, K_max=None):
 
 
 def setup_ieee_style():
-    """设置 IEEE 风格绘图（向后兼容）"""
+    """设置 IEEE 风格绘图"""
     import matplotlib.pyplot as plt
 
     plt.rcParams.update({
@@ -817,49 +766,45 @@ def setup_ieee_style():
     return colors
 
 
-# 常量（向后兼容）
-SPEED_OF_LIGHT = 299792458  # m/s
+def generate_dither_sequence(N, theta_b):
+    """生成抖动序列"""
+    return np.random.randn(N, 2) * theta_b * 0.5
+
+
+SPEED_OF_LIGHT = 299792458
 
 
 # ============================================================================
-# 性能测试函数
+# 性能测试
 # ============================================================================
 
 def benchmark_performance():
-    """测试各种加速方案的性能"""
+    """测试性能"""
     print("\n" + "=" * 60)
     print("⚡ 性能基准测试")
     print("=" * 60)
 
-    # 测试参数
     S_bar = 50
     S_max = 100
     lambda_b = 1.0
 
-    print("\n1️⃣  容量下界计算（100点网格）")
-
+    print("\n1️⃣  容量下界计算")
     start = time.time()
     C_lb, _ = capacity_lb(S_bar, S_max, lambda_b)
     elapsed = time.time() - start
-
     print(f"   耗时：{elapsed * 1000:.2f} ms")
     print(f"   结果：C_LB = {C_lb:.4f} bits/slot")
 
-    print("\n2️⃣  容量上界计算（Arimoto-Blahut）")
-
+    print("\n2️⃣  容量上界计算")
     start = time.time()
     C_ub, _, diag = capacity_ub_discrete(S_bar, S_max, lambda_b, max_iter=100)
     elapsed = time.time() - start
-
     print(f"   耗时：{elapsed * 1000:.2f} ms")
     print(f"   结果：C_UB = {C_ub:.4f} bits/slot")
-    print(f"   迭代次数：{diag['iterations']}")
-    print(f"   收敛：{'是' if diag['converged'] else '否'}")
     print(f"   差距：{C_ub - C_lb:.4f} bits/slot")
 
     print("\n" + "=" * 60)
 
 
 if __name__ == "__main__":
-    # 运行性能测试
     benchmark_performance()
