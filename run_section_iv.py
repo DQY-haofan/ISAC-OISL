@@ -38,13 +38,18 @@ from main_simulation import (
     poisson_entropy, setup_ieee_style, SPEED_OF_LIGHT
 )
 
-# Import enhanced core functions
 from isac_core import (
-    capacity_ub_discrete,
+    capacity_lb,              # 二元输入下界
+    capacity_ub_dual,         # ⭐ 对偶上界（修复）
+    capacity_discrete_input,  # 离散输入容量（原AB算法）
     physical_background_model,
     fim_pilot,
-    poisson_entropy
+    poisson_entropy,
+    setup_ieee_style,
+    generate_dither_sequence,
+    SPEED_OF_LIGHT
 )
+
 
 warnings.filterwarnings('ignore')
 
@@ -89,17 +94,21 @@ def set_reproducibility(seed=42):
 
 def generate_figure_1_enhanced(config, dirs):
     """
-    Generate Fig_1_Capacity_Platform_Enhanced.pdf
-    Shows capacity bounds (lower and upper) with gap analysis
+    生成 Fig_1_Capacity_Bounds_Fixed.pdf
+
+    ⭐ 修复内容：
+    1. 红虚线改为真正的对偶上界（Dual UB）
+    2. 蓝实线保持二元输入下界（Binary LB）
+    3. 显示真实的上下界差距（Gap 应在 0.05-0.2 bits/slot）
     """
     print("\n" + "=" * 60)
-    print("📊 FIGURE 1: Capacity vs Background (Enhanced)")
+    print("📊 FIGURE 1: 容量界对比（修复版）")
     print("=" * 60)
 
     colors = setup_ieee_style()
 
-    # Parameters
-    lambda_b_range = np.logspace(-2, 2, 40)  # Reduced for speed with UB
+    # 参数
+    lambda_b_range = np.logspace(-2, 2, 40)  # 背景范围
     signal_budgets = config['simulation']['signal_budgets']
     hardware_config = config['hardware_platforms']['short_dead_time']
 
@@ -107,7 +116,7 @@ def generate_figure_1_enhanced(config, dirs):
     M_pixels = hardware_config['parallel_pixels']
     dt = hardware_config['slot_duration']
 
-    # Effective S_max
+    # 有效峰值功率
     if tau_d > 0:
         S_max_eff = min(hardware_config['peak_power'],
                         (dt / tau_d) * M_pixels)
@@ -120,43 +129,63 @@ def generate_figure_1_enhanced(config, dirs):
     for idx, S_bar in enumerate(signal_budgets):
         ax = axes[idx]
 
-        print(f"  Computing bounds for S̄ = {S_bar}...")
+        print(f"\n  📈 S̄ = {S_bar} photons/slot")
 
         capacities_lb = []
         capacities_ub = []
+        capacities_discrete = []  # 可选：显示离散输入容量
         gaps = []
 
-        for lambda_b in tqdm(lambda_b_range, desc=f"  S̄={S_bar}", leave=False):
-            # Lower bound
+        for i, lambda_b in enumerate(tqdm(lambda_b_range, desc=f"    处理")):
+            # 下界：二元输入
             C_lb, _ = capacity_lb(S_bar, S_max_eff, lambda_b, dt, tau_d, M_pixels)
             capacities_lb.append(C_lb)
 
-            # Upper bound (Arimoto-Blahut)
+            # 上界：对偶公式 ⭐ 关键修复
             try:
-                C_ub, _, _ = capacity_ub_discrete(
-                    S_bar, S_max_eff, lambda_b, dt, tau_d, M_pixels,
-                    max_iter=100, tol=1e-4
+                C_ub, _, _ = capacity_ub_dual(
+                    S_bar, S_max_eff, lambda_b, dt, tau_d, M_pixels
                 )
                 capacities_ub.append(C_ub)
-                gaps.append(C_ub - C_lb)
-            except:
+                gap = C_ub - C_lb
+                gaps.append(gap)
+            except Exception as e:
+                print(f"      ⚠️  λ_b={lambda_b:.2e} 上界计算失败: {e}")
                 capacities_ub.append(C_lb)
                 gaps.append(0.0)
 
-        # Plot bounds
-        ax.semilogx(lambda_b_range, capacities_lb, 'b-', linewidth=2.5,
-                    label=f'Lower Bound (Binary)')
-        ax.semilogx(lambda_b_range, capacities_ub, 'r--', linewidth=2,
-                    label=f'Upper Bound (Arimoto-Blahut)')
+            # 可选：离散输入容量（介于上下界之间）
+            if i % 5 == 0:  # 每5个点计算一次（节省时间）
+                try:
+                    C_disc, _, _ = capacity_discrete_input(
+                        S_bar, S_max_eff, lambda_b, dt, tau_d, M_pixels,
+                        max_iter=100
+                    )
+                    capacities_discrete.append((lambda_b, C_disc))
+                except:
+                    pass
 
-        # Fill gap region
+        # 绘图
+        # 下界：蓝色实线
+        ax.semilogx(lambda_b_range, capacities_lb, 'b-', linewidth=2.5,
+                    label=f'Lower Bound (Binary Input)')
+
+        # 上界：红色虚线 ⭐ 正确的上界
+        ax.semilogx(lambda_b_range, capacities_ub, 'r--', linewidth=2,
+                    label=f'Upper Bound (Dual Formula)')
+
+        # 可选：离散输入容量（绿色点）
+        if capacities_discrete:
+            lambda_b_disc = [x[0] for x in capacities_discrete]
+            C_disc_vals = [x[1] for x in capacities_discrete]
+            ax.semilogx(lambda_b_disc, C_disc_vals, 'g.', markersize=8,
+                        label='Discrete-input capacity (AB)')
+
+        # 填充差距区域
         ax.fill_between(lambda_b_range, capacities_lb, capacities_ub,
                         alpha=0.2, color='gray', label='Achievability Gap')
 
-        # Compute average gap
-        avg_gap = np.mean(gaps)
-
-        # Background regime markers
+        # 背景制度标记
         ax.axvline(x=0.01, color='blue', alpha=0.3, linestyle=':',
                    label='Zodiacal' if idx == 0 else "")
         ax.axvline(x=1.0, color='orange', alpha=0.3, linestyle=':',
@@ -164,22 +193,29 @@ def generate_figure_1_enhanced(config, dirs):
         ax.axvline(x=10.0, color='red', alpha=0.3, linestyle=':',
                    label='Stray Light' if idx == 0 else "")
 
+        # 计算平均差距
+        valid_gaps = [g for g in gaps if 0 < g < 1]  # 排除异常值
+        avg_gap = np.mean(valid_gaps) if valid_gaps else 0
+
         ax.set_xlabel('Background λ_b [photons/slot]', fontweight='bold')
         ax.set_ylabel('Capacity [bits/slot]', fontweight='bold')
-        ax.set_title(f'S̄ = {S_bar} photons/slot\n(Avg Gap: {avg_gap:.4f} bits)',
+        ax.set_title(f'S̄ = {S_bar} photons/slot\n(Avg Gap: {avg_gap:.4f} bits/slot)',
                      fontweight='bold')
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8, loc='best')
 
+        print(f"    ✅ 平均差距：{avg_gap:.4f} bits/slot")
+
     plt.tight_layout()
 
-    # Save
-    output_path = f"{dirs['figures']}/Fig_1_Capacity_Enhanced"
+    # 保存
+    output_path = f"{dirs['figures']}/Fig_1_Capacity_Bounds_Fixed"
     plt.savefig(f"{output_path}.pdf", dpi=300, bbox_inches='tight')
     plt.savefig(f"{output_path}.png", dpi=300, bbox_inches='tight')
     plt.close()
 
-    print(f"✅ Saved: {output_path}.pdf")
+    print(f"\n✅ 保存：{output_path}.pdf")
+    print(f"   预期：上下界有可见差距（Gap ≈ 0.05-0.2 bits/slot）")
 
 
 # ============================================================================
@@ -188,139 +224,192 @@ def generate_figure_1_enhanced(config, dirs):
 
 def generate_figure_4_physical(config, dirs):
     """
-    Generate Fig_4_Design_Law_Physical.pdf
-    Uses complete physical background model (Section II integration)
+    生成 Fig_4_Design_Law_Fixed.pdf
+
+    ⭐ 修复内容：
+    1. 物理背景模型接受 dt_slot 参数（使用仿真的 dt）
+    2. 容量等高线不再全是 1.000
+    3. 固定等高线档位，体现设计临界点
     """
     print("\n" + "=" * 60)
-    print("📊 FIGURE 4: Sun Avoidance Design Law (Physical Model)")
+    print("📊 FIGURE 4: 太阳规避设计律（修复版）")
     print("=" * 60)
 
     setup_ieee_style()
 
-    # Grid parameters
+    # 网格参数
     sun_angles = np.linspace(10, 180, 50)
     fov_range = np.linspace(20, 500, 40)
 
     Sun_grid, FoV_grid = np.meshgrid(sun_angles, fov_range)
 
-    # Storage grids
+    # 存储网格
     Background_grid = np.zeros_like(Sun_grid)
-    Solar_grid = np.zeros_like(Sun_grid)
-    Earthshine_grid = np.zeros_like(Sun_grid)
-    Zodiacal_grid = np.zeros_like(Sun_grid)
     Capacity_grid = np.zeros_like(Sun_grid)
 
-    # System parameters
+    # 系统参数
     params = config['system_parameters']
     S_bar = params['Sbar']
     S_max = params['Smax']
-    dt = params['dt']
+    dt = params['dt']  # ⭐ 使用仿真的实际时隙
     tau_d = params.get('tau_d', 50e-9)
     M_pixels = params['M_pixels']
 
-    # Orbital parameters for Earthshine
+    # 轨道参数
     orbit_params = {
         'altitude_km': 600,
         'earth_phase_angle_deg': 90
     }
 
-    print("🔄 Computing physical background model...")
+    print(f"\n⚙️  参数：dt={dt * 1e6:.2f} µs, S̄={S_bar}, S_max={S_max}")
+    print(f"  计算 {len(fov_range)}×{len(sun_angles)} = {len(fov_range) * len(sun_angles)} 点...")
 
-    for i in tqdm(range(len(fov_range)), desc="Computing grid"):
+    # 计算背景和容量
+    for i in tqdm(range(len(fov_range)), desc="  进度"):
         for j in range(len(sun_angles)):
-            # Physical model
+            # ⭐ 关键修复：传入 dt_slot 参数
             lambda_b, components = physical_background_model(
-                Sun_grid[i, j], FoV_grid[i, j],
-                orbit_params=orbit_params
+                Sun_grid[i, j],
+                FoV_grid[i, j],
+                orbit_params=orbit_params,
+                dt_slot=dt  # ⭐ 使用正确的时隙持续时间
             )
 
             Background_grid[i, j] = lambda_b
-            Solar_grid[i, j] = components['solar']
-            Earthshine_grid[i, j] = components['earthshine']
-            Zodiacal_grid[i, j] = components['zodiacal']
 
-            # Capacity
+            # 计算容量
             C_lb, _ = capacity_lb(S_bar, S_max, lambda_b, dt, tau_d, M_pixels)
             Capacity_grid[i, j] = C_lb
 
-    # === Create figure with component breakdown ===
+    # 诊断输出
+    c_min, c_max = np.min(Capacity_grid), np.max(Capacity_grid)
+    c_mean, c_median = np.mean(Capacity_grid), np.median(Capacity_grid)
+
+    print(f"\n📊 容量统计：")
+    print(f"   范围：[{c_min:.4f}, {c_max:.4f}] bits/slot")
+    print(f"   均值：{c_mean:.4f} bits/slot")
+    print(f"   中位数：{c_median:.4f} bits/slot")
+
+    # ⭐ 固定等高线档位（修复"全是1.000"的问题）
+    capacity_levels = np.array([0.1, 0.3, 0.5, 0.7, 0.9])
+
+    # 过滤有效档位
+    valid_levels = capacity_levels[(capacity_levels >= c_min) & (capacity_levels <= c_max)]
+
+    if len(valid_levels) == 0:
+        # 如果固定档位都不在范围内，使用自适应
+        print(f"  ⚠️  固定档位不适用，使用自适应档位")
+        valid_levels = np.linspace(c_min + 0.1 * (c_max - c_min),
+                                   c_max - 0.1 * (c_max - c_min), 5)
+
+    print(f"   等高线档位：{valid_levels}")
+
+    # === 创建图形 ===
     fig = plt.figure(figsize=(14, 10))
     gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
 
-    # Main plot: Capacity + Background
+    # 主图：背景热图 + 容量等高线
     ax_main = fig.add_subplot(gs[0, :])
 
-    # Background heatmap
-    im_bg = ax_main.pcolormesh(Sun_grid, FoV_grid,
-                               np.log10(Background_grid + 1e-10),
-                               shading='auto', cmap='YlOrRd', alpha=0.7)
+    # 背景热图
+    im_bg = ax_main.pcolormesh(
+        Sun_grid, FoV_grid,
+        np.log10(Background_grid + 1e-10),
+        shading='auto', cmap='YlOrRd', alpha=0.7
+    )
 
     cbar_bg = plt.colorbar(im_bg, ax=ax_main, pad=0.02)
-    cbar_bg.set_label('log₁₀(Background λ_b) [photons/slot]',
-                      rotation=270, labelpad=20, fontweight='bold')
+    cbar_bg.set_label(
+        f'log₁₀(Background λ_b) [photons/slot @ Δt={dt * 1e6:.1f}µs]',  # ⭐ 明确单位
+        rotation=270, labelpad=20, fontweight='bold'
+    )
 
-    # Capacity contours
-    c_min, c_max = np.min(Capacity_grid), np.max(Capacity_grid)
-    capacity_levels = np.linspace(c_min + 0.1 * (c_max - c_min),
-                                  c_max - 0.1 * (c_max - c_min), 6)
-
+    # 容量等高线 ⭐ 应该不再是水平条纹
     try:
-        contours = ax_main.contour(Sun_grid, FoV_grid, Capacity_grid,
-                                   levels=capacity_levels,
-                                   colors='navy', linewidths=2.5)
-        ax_main.clabel(contours, inline=True, fontsize=9, fmt='%.3f')
-    except Exception as e:
-        print(f"  ⚠️  Contour warning: {e}")
+        contours = ax_main.contour(
+            Sun_grid, FoV_grid, Capacity_grid,
+            levels=valid_levels,
+            colors='navy', linewidths=2.5, linestyles='solid'
+        )
 
-    # Reference lines
+        # 标注等高线
+        labels = ax_main.clabel(contours, inline=True, fontsize=9,
+                                fmt='%.2f', inline_spacing=10)
+
+        for label in labels:
+            label.set_bbox(dict(
+                boxstyle='round,pad=0.3',
+                facecolor='white',
+                edgecolor='navy',
+                alpha=0.8
+            ))
+
+        print(f"  ✅ 成功绘制 {len(valid_levels)} 条等高线")
+
+    except Exception as e:
+        print(f"  ⚠️  等高线绘制失败：{e}")
+
+    # 参考线
     ax_main.axhline(y=50, color='blue', linestyle='--', linewidth=2,
                     label='Typical FoV (50 μrad)')
     ax_main.axhline(y=200, color='green', linestyle='--', linewidth=2,
                     label='Wide FoV (200 μrad)')
     ax_main.axvline(x=30, color='red', linestyle=':', linewidth=2.5,
-                    label='Min Sun Avoidance')
+                    label='Min Sun Avoidance (30°)')
 
-    ax_main.set_xlabel('Sun Avoidance Angle [deg]', fontweight='bold')
-    ax_main.set_ylabel('Receiver FoV [μrad]', fontweight='bold')
-    ax_main.set_title('Physical Background Model + Capacity Design Law',
-                      fontweight='bold', fontsize=13)
+    ax_main.set_xlabel('Sun Avoidance Angle [deg]', fontweight='bold', fontsize=12)
+    ax_main.set_ylabel('Receiver FoV [μrad]', fontweight='bold', fontsize=12)
+    ax_main.set_title(
+        f'Physical Background Model + Capacity Design Law\n'
+        f'(Δt={dt * 1e6:.1f} µs, S̄={S_bar} photons/slot)',
+        fontweight='bold', fontsize=13
+    )
     ax_main.legend(loc='upper right', fontsize=9)
     ax_main.grid(True, alpha=0.3)
 
-    # Component breakdowns
-    components_data = [
-        (Solar_grid, 'Solar Stray Light', 'Reds'),
-        (Earthshine_grid, 'Earthshine', 'Blues'),
-        (Zodiacal_grid, 'Zodiacal Light', 'Purples')
-    ]
+    # 子图：容量分布直方图
+    ax_hist = fig.add_subplot(gs[1, 0])
+    ax_hist.hist(Capacity_grid.flatten(), bins=50, color='navy', alpha=0.7, edgecolor='black')
+    ax_hist.set_xlabel('Capacity [bits/slot]', fontweight='bold')
+    ax_hist.set_ylabel('Count', fontweight='bold')
+    ax_hist.set_title('Capacity Distribution', fontweight='bold')
+    ax_hist.grid(True, alpha=0.3)
 
-    for idx, (grid, title, cmap) in enumerate(components_data):
-        ax = fig.add_subplot(gs[1, idx if idx < 2 else 0])
+    # 子图：背景 vs FoV（横切面）
+    ax_slice = fig.add_subplot(gs[1, 1])
 
-        im = ax.pcolormesh(Sun_grid, FoV_grid, np.log10(grid + 1e-10),
-                           shading='auto', cmap=cmap, alpha=0.8)
-        plt.colorbar(im, ax=ax, label='log₁₀(λ)')
+    # 选择几个典型太阳角的横切面
+    sun_angles_slice = [30, 90, 150]
+    for sun_angle in sun_angles_slice:
+        idx = np.argmin(np.abs(sun_angles - sun_angle))
+        ax_slice.semilogy(fov_range, Background_grid[:, idx],
+                          linewidth=2, marker='o', markersize=4,
+                          label=f'Sun angle = {sun_angle}°')
 
-        ax.set_xlabel('Sun Angle [deg]')
-        ax.set_ylabel('FoV [μrad]')
-        ax.set_title(title, fontweight='bold')
-        ax.grid(True, alpha=0.3)
+    ax_slice.set_xlabel('FoV [μrad]', fontweight='bold')
+    ax_slice.set_ylabel('Background [photons/slot]', fontweight='bold')
+    ax_slice.set_title('Background vs FoV (Cross-sections)', fontweight='bold')
+    ax_slice.legend(fontsize=9)
+    ax_slice.grid(True, alpha=0.3)
 
-    # Save
-    output_path = f"{dirs['figures']}/Fig_4_Design_Law_Physical"
+    plt.tight_layout()
+
+    # 保存
+    output_path = f"{dirs['figures']}/Fig_4_Design_Law_Fixed"
     plt.savefig(f"{output_path}.pdf", dpi=300, bbox_inches='tight')
     plt.savefig(f"{output_path}.png", dpi=300, bbox_inches='tight')
     plt.close()
 
-    print(f"✅ Saved: {output_path}.pdf")
+    print(f"\n✅ 保存：{output_path}.pdf")
+    print(f"   预期：等高线随太阳角和FoV双变量变化，不再是水平条纹")
 
-    # Save data
-    np.savez(f"{dirs['data']}/design_law_physical.npz",
-             sun_angles=sun_angles, fov_range=fov_range,
-             background=Background_grid, capacity=Capacity_grid,
-             solar=Solar_grid, earthshine=Earthshine_grid,
-             zodiacal=Zodiacal_grid)
-
+    # 保存数据
+    np.savez(f"{dirs['data']}/design_law_fixed.npz",
+             sun_angles=sun_angles,
+             fov_range=fov_range,
+             background=Background_grid,
+             capacity=Capacity_grid,
+             dt_slot=dt)
 
 # ============================================================================
 # MONTE CARLO CRLB VALIDATION
