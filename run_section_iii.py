@@ -20,10 +20,10 @@ from math import ceil, sqrt, exp, log, pi
 import os
 from tqdm import tqdm
 import warnings
-
+import multiprocessing as mp
+from functools import partial
 
 warnings.filterwarnings('ignore')
-
 # ============================================================================
 # CONSTANTS & STYLE
 # ============================================================================
@@ -510,15 +510,98 @@ def generate_fig_fim_vs_resources(params, scenarios, output_dir='./', verbose=Fa
 # FIGURE 3: PARETO BOUNDARY (PATCH B: ADAPTIVE D_TARGETS)
 # ============================================================================
 
-def generate_fig_pareto_boundary(params, scenarios, output_dir='./', verbose=False):
+def _compute_pareto_point_worker(args):
+    """
+    Worker function for parallel Pareto point computation
+
+    This function is designed to be pickled for multiprocessing.
+    All necessary data is passed through args tuple.
+    """
+    (D_max, alpha_search, rho_search, params, params_sim,
+     dither_seq, Smax_eff, scenario_r_b) = args
+
+    max_rate = 0.0
+    best_alpha, best_rho = 0, 0
+
+    for alpha in alpha_search:
+        for rho in rho_search:
+            try:
+                # Compute A_pilot_use
+                A_pilot_use = min(Smax_eff, 4.0 * params['Sbar']) * 0.8
+                A_pilot_use = min(A_pilot_use, Smax_eff)
+
+                # Data signal
+                S_data = (1 - rho) * params['Sbar'] / (1 - alpha)
+
+                # Compute FIM
+                I_pilot = fim_pilot(
+                    alpha, rho, params['Sbar'], params['N'],
+                    params['dt'], params_sim, dither_seq,
+                    params['tau_d'], A_pilot_use, params['M_pixels']
+                )
+
+                # Regularization
+                J = I_pilot + params['J_P'] + 1e-12 * np.eye(4)
+
+                # Check condition number
+                if np.linalg.cond(J) > 1e30:
+                    continue
+
+                # Compute MSE
+                J_inv = np.linalg.inv(J)
+                mse_current = np.trace(params['W'] @ J_inv)
+
+                # Check MSE constraint
+                if mse_current > D_max:
+                    continue
+
+                # Compute achievable rate
+                C_data, _ = capacity_lb(
+                    S_data, params['Smax'], scenario_r_b,
+                    params['dt'], params['tau_d'], params['M_pixels']
+                )
+                rate = (1 - alpha) * C_data
+
+                # Update best
+                if rate > max_rate:
+                    max_rate = rate
+                    best_alpha, best_rho = alpha, rho
+
+            except Exception:
+                continue
+
+    return (max_rate, D_max, best_alpha, best_rho) if max_rate > 0 else None
+
+
+def generate_fig_pareto_boundary(params, scenarios, output_dir='./',
+                                 verbose=False, n_workers=None):
     """
     Generate Pareto boundary with PATCH B: Adaptive D_targets
+
+    ** PARALLEL VERSION **
+
+    Parameters:
+    -----------
+    n_workers : int or None
+        Number of parallel workers. If None, uses (CPU_count - 1).
+        Set to 1 to disable parallelization.
     """
     print("\n" + "=" * 60)
-    print("Figure 3: Rate-MSE Pareto (PATCH B: Adaptive)")
+    print("Figure 3: Rate-MSE Pareto (PATCH B: Adaptive + PARALLEL)")
     print("=" * 60)
 
-    # PATCH B: Adaptive D_targets based on achievable MSE range
+    # Determine number of workers
+    if n_workers is None:
+        n_workers = max(1, mp.cpu_count() - 1)
+    n_workers = max(1, n_workers)  # At least 1 worker
+
+    print(f"🚀 Using {n_workers} parallel worker(s)")
+    print(f"   Available CPU cores: {mp.cpu_count()}")
+
+    # ========================================================================
+    # PHASE 1: Probe achievable MSE range (Sequential - Fast)
+    # ========================================================================
+
     alpha_probe = np.linspace(0.1, 0.9, 10)
     rho_probe = np.linspace(0.1, 0.9, 10)
     max_pilots = int(0.9 * params['N'])
@@ -542,81 +625,84 @@ def generate_fig_pareto_boundary(params, scenarios, output_dir='./', verbose=Fal
     print("Probing achievable MSE range...")
     for alpha in alpha_probe:
         for rho in rho_probe:
-            I_pilot = fim_pilot(alpha, rho, params['Sbar'], params['N'], params['dt'],
-                                params_probe, dither_seq, params['tau_d'],
-                                A_pilot_use, params['M_pixels'])
-            J = I_pilot + params['J_P'] + 1e-12 * np.eye(4)
-            if np.linalg.cond(J) < 1e30:
-                mse = np.trace(params['W'] @ np.linalg.inv(J))
-                if np.isfinite(mse) and mse > 0:
-                    mse_samples.append(mse)
+            try:
+                I_pilot = fim_pilot(alpha, rho, params['Sbar'], params['N'], params['dt'],
+                                    params_probe, dither_seq, params['tau_d'],
+                                    A_pilot_use, params['M_pixels'])
+                J = I_pilot + params['J_P'] + 1e-12 * np.eye(4)
+                if np.linalg.cond(J) < 1e30:
+                    mse = np.trace(params['W'] @ np.linalg.inv(J))
+                    if np.isfinite(mse) and mse > 0:
+                        mse_samples.append(mse)
+            except:
+                pass
 
     if len(mse_samples) == 0:
-        print("⚠ No valid MSE samples, using fallback range")
+        print("⚠️  No valid MSE samples, using fallback range")
         D_targets = np.logspace(-6, -2, 12)
     else:
         mmin, mmed, mmax = np.percentile(mse_samples, [5, 50, 95])
         D_targets = np.logspace(np.log10(mmin * 0.8), np.log10(mmax * 1.2), 12)
-        print(f"✓ Adaptive MSE range: [{mmin:.3e}, {mmax:.3e}]")
-        print(f"  D_targets: [{D_targets[0]:.3e}, {D_targets[-1]:.3e}]")
+        print(f"✅ Adaptive MSE range: [{mmin:.3e}, {mmax:.3e}]")
+        print(f"   D_targets: [{D_targets[0]:.3e}, {D_targets[-1]:.3e}]")
 
-    # Now compute Pareto boundary
-    alpha_search = np.linspace(0.05, 0.95, 19)  # Denser grid
+    # ========================================================================
+    # PHASE 2: Compute Pareto boundary (PARALLEL)
+    # ========================================================================
+
+    alpha_search = np.linspace(0.05, 0.95, 19)
     rho_search = np.linspace(0.05, 0.95, 19)
 
     pareto_results = {}
 
     for scenario_name, scenario in scenarios.items():
-        print(f"\nProcessing {scenario_name} (λ_b={scenario['r_b']})...")
+        print(f"\n{'=' * 60}")
+        print(f"Processing {scenario_name} (λ_b={scenario['r_b']})")
+        print(f"{'=' * 60}")
 
         params_sim = params.copy()
         params_sim['r_b'] = scenario['r_b']
-        pareto_points = []
 
-        for D_max in tqdm(D_targets, desc=scenario_name):
-            max_rate = 0.0
+        # Prepare arguments for parallel workers
+        worker_args = [
+            (D_max, alpha_search, rho_search, params, params_sim,
+             dither_seq, Smax_eff, scenario['r_b'])
+            for D_max in D_targets
+        ]
 
-            for alpha in alpha_search:
-                for rho in rho_search:
-                    try:
-                        A_pilot_use = min(Smax_eff, 4.0 * params['Sbar']) * 0.8
-                        A_pilot_use = min(A_pilot_use, Smax_eff)
+        # Execute in parallel
+        if n_workers > 1:
+            print(f"🔄 Parallel computation with {n_workers} workers...")
+            with mp.Pool(n_workers) as pool:
+                # Use imap for progress tracking
+                results = list(tqdm(
+                    pool.imap(_compute_pareto_point_worker, worker_args),
+                    total=len(D_targets),
+                    desc=f"  {scenario_name}"
+                ))
+        else:
+            print(f"🔄 Sequential computation (single worker)...")
+            results = [
+                _compute_pareto_point_worker(args)
+                for args in tqdm(worker_args, desc=f"  {scenario_name}")
+            ]
 
-                        # PATCH B: Remove external S_data check (capacity_lb handles it)
-                        S_data = (1 - rho) * params['Sbar'] / (1 - alpha)
+        # Filter valid results
+        pareto_points = [r for r in results if r is not None]
+        pareto_results[scenario_name] = [
+            (rate, D_max) for (rate, D_max, _, _) in pareto_points
+        ]
 
-                        I_pilot = fim_pilot(alpha, rho, params['Sbar'], params['N'],
-                                            params['dt'], params_sim, dither_seq,
-                                            params['tau_d'], A_pilot_use, params['M_pixels'])
+        print(f"✅ Found {len(pareto_points)}/{len(D_targets)} valid Pareto points")
 
-                        J = I_pilot + params['J_P']
-                        J += 1e-12 * np.eye(4)
+    # ========================================================================
+    # PHASE 3: Plot results (Sequential - Fast)
+    # ========================================================================
 
-                        if np.linalg.cond(J) > 1e30:
-                            continue
+    print(f"\n{'=' * 60}")
+    print("📊 Generating plot...")
+    print(f"{'=' * 60}")
 
-                        J_inv = np.linalg.inv(J)
-                        mse_current = np.trace(params['W'] @ J_inv)
-
-                        if mse_current > D_max:
-                            continue
-
-                        C_data, _ = capacity_lb(S_data, params['Smax'], scenario['r_b'],
-                                                params['dt'], params['tau_d'], params['M_pixels'])
-                        rate = (1 - alpha) * C_data
-
-                        if rate > max_rate:
-                            max_rate = rate
-                    except:
-                        continue
-
-            if max_rate > 0:
-                pareto_points.append((max_rate, D_max))
-
-        pareto_results[scenario_name] = pareto_points
-        print(f"  Found {len(pareto_points)} Pareto points")
-
-    # Plot
     fig, ax = plt.subplots(figsize=(4, 3))
 
     for scenario_name, scenario in scenarios.items():
@@ -625,6 +711,7 @@ def generate_fig_pareto_boundary(params, scenarios, output_dir='./', verbose=Fal
             rates = [p[0] for p in points]
             mses = [p[1] for p in points]
 
+            # Sort by MSE for proper plotting
             sorted_pairs = sorted(zip(mses, rates))
             mses_sorted = [p[0] for p in sorted_pairs]
             rates_sorted = [p[1] for p in sorted_pairs]
@@ -632,6 +719,8 @@ def generate_fig_pareto_boundary(params, scenarios, output_dir='./', verbose=Fal
             ax.loglog(mses_sorted, rates_sorted, 'o-',
                       color=scenario['color'], linewidth=2, markersize=5,
                       label=scenario["name"])
+        else:
+            print(f"⚠️  No valid points for {scenario_name}")
 
     ax.set_xlabel('MSE (μx, μy) [rad²]', fontsize=10, weight='bold')
     ax.set_ylabel('Rate [bits/slot]', fontsize=10, weight='bold')
@@ -645,7 +734,7 @@ def generate_fig_pareto_boundary(params, scenarios, output_dir='./', verbose=Fal
     plt.savefig(f'{output_dir}/rate_mse_boundary.png', dpi=300, bbox_inches='tight')
     plt.close()
 
-    print(f"✓ Saved: rate_mse_boundary.pdf/png")
+    print(f"✅ Saved: rate_mse_boundary.pdf/png")
     return pareto_results
 
 
