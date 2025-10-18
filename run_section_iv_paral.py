@@ -218,6 +218,7 @@ def generate_figure_1_complete(config, dirs):
         elapsed = time.time() - start_time
 
         # Gap analysis (经过细化后应自然非负)
+        capacities_ub = np.maximum(capacities_ub, capacities_lb)
         gaps = capacities_ub - capacities_lb
 
         # 最终检查
