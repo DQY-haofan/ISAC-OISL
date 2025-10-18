@@ -169,9 +169,27 @@ def capacity_lb_batch_gpu(S_bar, S_max, lambda_b_array, dt=1e-6, tau_d=50e-9, M_
     # 互信息：H(Y) - (1-p)*H(Y|X=0) - p*H(Y|X=A)
     log2 = cp.log(2)
 
-    H_Y = -cp.sum(cp.where(PY > 1e-20, PY * cp.log(PY) / log2, 0), axis=2)  # (N, N_A)
-    H_Y0 = -cp.sum(cp.where(P0 > 1e-20, P0 * cp.log(P0) / log2, 0), axis=2)  # (N, 1)
-    H_YA = -cp.sum(cp.where(PA > 1e-20, PA * cp.log(PA) / log2, 0), axis=2)  # (N, N_A)
+    # ✅ 替换为（修复版 - 更安全）
+    log2 = cp.log(2)
+
+    # 关键：先clamp概率到安全范围，避免log(0)
+    PY_safe = cp.clip(PY, 1e-30, 1.0)  # 把0替换为极小值
+    P0_safe = cp.clip(P0, 1e-30, 1.0)
+    PA_safe = cp.clip(PA, 1e-30, 1.0)
+
+    # 计算log（现在安全了）
+    log_PY = cp.log(PY_safe) / log2
+    log_P0 = cp.log(P0_safe) / log2
+    log_PA = cp.log(PA_safe) / log2
+
+    # 计算熵，用mask排除真正为0的项
+    mask_Y = (PY > 1e-20)
+    mask_0 = (P0 > 1e-20)
+    mask_A = (PA > 1e-20)
+
+    H_Y = -cp.sum(cp.where(mask_Y, PY * log_PY, 0), axis=2)
+    H_Y0 = -cp.sum(cp.where(mask_0, P0 * log_P0, 0), axis=2)
+    H_YA = -cp.sum(cp.where(mask_A, PA * log_PA, 0), axis=2)
 
     I = H_Y - (1 - p_vals[None, :]) * H_Y0 - p_vals[None, :] * H_YA  # (N, N_A)
 
