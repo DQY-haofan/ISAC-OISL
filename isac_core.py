@@ -618,27 +618,140 @@ def physical_background_model(sun_angle_deg, fov_urad,
 # ============================================================================
 # 辅助函数（保留）
 # ============================================================================
+def validate_fim(I, J_P=None, threshold=1e30):
+    """
+    验证FIM的数值稳定性
+
+    参数:
+        I: Pilot FIM (4×4)
+        J_P: Prior FIM (4×4, optional)
+        threshold: 条件数阈值
+
+    返回:
+        is_valid: bool
+        diagnostics: dict
+    """
+    J = I.copy()
+
+    if J_P is not None:
+        J += J_P
+
+    # 添加正则化
+    J += 1e-12 * np.eye(4)
+
+    # 计算条件数
+    try:
+        cond_num = np.linalg.cond(J)
+
+        if cond_num < threshold:
+            J_inv = np.linalg.inv(J)
+
+            # 提取指向参数的CRLB
+            W = np.diag([1.0, 1.0, 0.0, 0.0])
+            mse_pointing = np.trace(W @ J_inv)
+
+            diagnostics = {
+                'valid': True,
+                'condition_number': cond_num,
+                'mse_pointing': mse_pointing,
+                'eigenvalues': np.linalg.eigvals(J).tolist()
+            }
+
+            return True, diagnostics
+        else:
+            diagnostics = {
+                'valid': False,
+                'condition_number': cond_num,
+                'reason': f'Condition number {cond_num:.2e} exceeds threshold'
+            }
+            return False, diagnostics
+
+    except np.linalg.LinAlgError as e:
+        diagnostics = {
+            'valid': False,
+            'reason': f'LinAlgError: {str(e)}'
+        }
+        return False, diagnostics
+
+
 
 def fim_pilot(alpha, rho, Sbar, N, dt, params, dither_seq,
-              tau_d=None, S_pilot_override=None, M_pixels=16):
-    """FIM 计算（简化版）"""
+              tau_d=None, A_pilot=None, M_pixels=16):
+    """
+    Fisher Information Matrix 计算（完全遵循Algorithm 1）
+
+    ✅ 修复要点：
+    1. A_pilot必须作为固定参数传入（Assumption A2）
+    2. 死区修正 g_dead = (1 + r*tau_d)^(-2)
+    3. r_b视为rate (photons/s)
+    4. 确保N_pilot计算正确
+
+    参数:
+        alpha: 时间分配比例 [0,1]
+        rho: 光子分配比例 [0,1]
+        Sbar: 平均功率约束 (photons/slot)
+        N: 总时隙数
+        dt: 时隙宽度 (seconds)
+        params: 系统参数字典，必须包含:
+            - r_b: 背景率 (photons/s) ⚠️
+            - theta_b: 波束发散角 (radians)
+            - sigma2: 指向方差 (rad^2)
+            - mu_x, mu_y: 指向偏差 (radians)
+        dither_seq: 抖动序列 (N_pilot × 2)
+        tau_d: 死区时间 (seconds)
+        A_pilot: 固定pilot幅度 (photons/slot) ⭐ 必传
+        M_pixels: 并行像素数
+
+    返回:
+        I: Fisher信息矩阵 (4×4)
+    """
+
+    # ============================================================================
+    # Step 0: 参数提取与验证
+    # ============================================================================
+
     theta_b = params['theta_b']
     sigma_point_sq = params.get('sigma2', 1e-12)
-    r_b = params['r_b']
+    r_b = params['r_b']  # ⚠️ 这是rate (photons/s)
 
     if tau_d is None:
         tau_d = params.get('tau_d', 50e-9)
 
+    # ⭐ 计算有效峰值功率（考虑死区）
     S_max_eff = params.get('Smax', 100)
-    if tau_d > 0:
+    if tau_d > 0 and M_pixels > 0:
         S_max_eff = min(S_max_eff, M_pixels * dt / tau_d)
 
-    if S_pilot_override is not None:
-        A_pilot = S_pilot_override
-    else:
+    # ⭐ A_pilot必须传入（Assumption A2）
+    if A_pilot is None:
+        # 后备：使用0.5 S_max_eff
         A_pilot = 0.5 * S_max_eff
+        print(f"⚠️ Warning: A_pilot not provided, using default {A_pilot:.2f}")
 
-    N_pilot = int(min(alpha * N, (rho * Sbar * N) / A_pilot))
+    # Ensure A_pilot不超过峰值
+    A_pilot = min(A_pilot, S_max_eff)
+
+    # ============================================================================
+    # Step 1: 计算pilot槽数（Algorithm 1的关键）
+    # ============================================================================
+
+    # N_pilot = min{⌊αN⌋, ⌊ρS̄N/A_pilot⌋}
+    N_pilot_time = int(alpha * N)
+    N_pilot_photon = int((rho * Sbar * N) / A_pilot)
+    N_pilot = min(N_pilot_time, N_pilot_photon)
+
+    # 安全检查
+    if N_pilot <= 0:
+        print(f"⚠️ Warning: N_pilot={N_pilot}, returning zero FIM")
+        return np.zeros((4, 4))
+
+    if N_pilot > len(dither_seq):
+        print(f"⚠️ Warning: N_pilot={N_pilot} > dither length={len(dither_seq)}")
+        N_pilot = len(dither_seq)
+
+    # ============================================================================
+    # Step 2: 预计算常数
+    # ============================================================================
 
     mu_true = np.array([params.get('mu_x', 1e-6), params.get('mu_y', 0.5e-6)])
 
@@ -648,16 +761,36 @@ def fim_pilot(alpha, rho, Sbar, N, dt, params, dither_seq,
 
     I = np.zeros((4, 4))
 
-    for n in range(min(N_pilot, len(dither_seq))):
+    # ============================================================================
+    # Step 3: 主循环 - 遍历pilot时隙
+    # ============================================================================
+
+    for n in range(N_pilot):
+        # --------------------------------------------------------------------
+        # Step 3.1: 应用抖动（Proposition 3: Identifiability）
+        # --------------------------------------------------------------------
         d_n = dither_seq[n]
         mu_eff = mu_true + d_n
 
+        # --------------------------------------------------------------------
+        # Step 3.2: 计算期望指向损耗
+        # --------------------------------------------------------------------
         L_p = (1.0 / gamma) * np.exp(-b * np.dot(mu_eff, mu_eff) / gamma)
 
+        # --------------------------------------------------------------------
+        # Step 3.3: 计算死区前的光子数（⚠️ 关键单位转换）
+        # --------------------------------------------------------------------
+        # 信号: A_pilot × L_p (photons/slot)
+        # 背景: r_b × dt (photons/s × s = photons/slot)
         lambda_n_pre = A_pilot * L_p + r_b * dt
-        r_n_pre = lambda_n_pre / dt
+        r_n_pre = lambda_n_pre / dt  # 转为rate (photons/s)
 
+        # --------------------------------------------------------------------
+        # Step 3.4: 死区修正（Proposition 4: Diminishing Returns）
+        # --------------------------------------------------------------------
         if tau_d > 0:
+            # 非并行死区模型: r' = r / (1 + r*tau_d)
+            # 链式法则系数: dr'/dr = 1 / (1 + r*tau_d)^2
             g_dead = 1.0 / ((1 + r_n_pre * tau_d) ** 2)
             r_n_post = r_n_pre / (1 + r_n_pre * tau_d)
             lambda_n = r_n_post * dt
@@ -665,19 +798,41 @@ def fim_pilot(alpha, rho, Sbar, N, dt, params, dither_seq,
             g_dead = 1.0
             lambda_n = lambda_n_pre
 
+        # 数值稳定性检查
         if lambda_n < 1e-20:
             continue
 
+        # --------------------------------------------------------------------
+        # Step 3.5: 计算偏导数（带链式法则）
+        # --------------------------------------------------------------------
+        # 基础因子（信号部分对参数的敏感度）
         base_factor = g_dead * A_pilot * L_p
 
-        grad = np.array([
-            base_factor * (-2 * b * mu_eff[0] / gamma),
-            base_factor * (-2 * b * mu_eff[1] / gamma),
-            base_factor * (-a / gamma + a * b * np.dot(mu_eff, mu_eff) / (gamma ** 2)),
-            g_dead * dt
-        ])
+        # ∂λ/∂μx = base_factor × (-2b*μx/γ)
+        grad_mux = base_factor * (-2 * b * mu_eff[0] / gamma)
 
+        # ∂λ/∂μy = base_factor × (-2b*μy/γ)
+        grad_muy = base_factor * (-2 * b * mu_eff[1] / gamma)
+
+        # ∂λ/∂σ² = base_factor × (-a/γ + ab||μ||²/γ²)
+        grad_sigma = base_factor * (
+                -a / gamma + a * b * np.dot(mu_eff, mu_eff) / (gamma ** 2)
+        )
+
+        # ∂λ/∂r_b = g_dead × dt （背景项的贡献）
+        grad_rb = g_dead * dt
+
+        # 梯度向量
+        grad = np.array([grad_mux, grad_muy, grad_sigma, grad_rb])
+
+        # --------------------------------------------------------------------
+        # Step 3.6: 累积Fisher信息 I += (1/λ) ∇∇ᵀ
+        # --------------------------------------------------------------------
         I += np.outer(grad, grad) / lambda_n
+
+    # ============================================================================
+    # Step 4: 返回
+    # ============================================================================
 
     return I
 
@@ -740,27 +895,66 @@ def generate_dither_sequence(N, theta_b):
 SPEED_OF_LIGHT = 299792458
 
 if __name__ == "__main__":
-    print("⚡ GPU加速测试...")
+    print("=" * 60)
+    print("FIM Computation Example (Fixed Version)")
+    print("=" * 60)
 
-    # 测试批量计算
-    S_bar = 50
-    S_max = 100
-    lambda_b_array = np.logspace(-2, 2, 20)
+    # 参数设置
+    params = {
+        'Sbar': 50.0,
+        'Smax': 100.0,
+        'dt': 1e-6,
+        'N': 10000,
+        'theta_b': 10e-6,
+        'mu_x': 1e-6,
+        'mu_y': 0.5e-6,
+        'sigma2': 1e-12,
+        'r_b': 1.0,  # ⚠️ photons/s
+        'tau_d': 50e-9,
+        'M_pixels': 16,
+        'J_P': np.diag([1e12, 1e12, 1e6, 1e-3])
+    }
 
-    print(f"\n测试参数：{len(lambda_b_array)} 个背景光子数点")
+    # 资源分配
+    alpha = 0.3
+    rho = 0.5
 
-    # 测试下界
-    start = time.time()
-    C_lb_array, _ = capacity_lb_batch_gpu(S_bar, S_max, lambda_b_array)
-    t_gpu = time.time() - start
+    # 计算有效峰值
+    Smax_eff = min(params['Smax'],
+                   params['M_pixels'] * params['dt'] / params['tau_d'])
 
-    print(f"✅ GPU批量计算：{t_gpu:.3f} 秒")
-    print(f"   平均容量：{np.mean(C_lb_array):.4f} bits/slot")
+    # ⭐ 固定pilot幅度（Assumption A2）
+    A_pilot = min(Smax_eff, 4.0 * params['Sbar']) * 0.8
 
-    # 对比CPU
-    start = time.time()
-    C_lb_cpu = [capacity_lb(S_bar, S_max, lb)[0] for lb in lambda_b_array[:5]]
-    t_cpu = (time.time() - start) * 4  # 估算全部时间
+    print(f"\n📊 Configuration:")
+    print(f"   S̄ = {params['Sbar']}, S_max_eff = {Smax_eff:.2f}")
+    print(f"   α = {alpha}, ρ = {rho}")
+    print(f"   A_pilot = {A_pilot:.2f} photons/slot")
+    print(f"   r_b = {params['r_b']} photons/s")
 
-    print(f"📊 CPU串行估算：{t_cpu:.3f} 秒")
-    print(f"🚀 加速比：{t_cpu / t_gpu:.1f}x")
+    # 生成抖动序列
+    N_pilot = int(min(alpha * params['N'],
+                      (rho * params['Sbar'] * params['N']) / A_pilot))
+    dither_seq = np.random.randn(N_pilot, 2) * params['theta_b'] * 0.5
+
+    print(f"   N_pilot = {N_pilot}")
+
+    # 计算FIM
+    print(f"\n🔄 Computing FIM...")
+    I_pilot = fim_pilot(
+        alpha, rho, params['Sbar'], params['N'],
+        params['dt'], params, dither_seq,
+        params['tau_d'], A_pilot, params['M_pixels']
+    )
+
+    # 验证
+    is_valid, diag = validate_fim(I_pilot, params['J_P'])
+
+    print(f"\n✅ Results:")
+    print(f"   Valid: {is_valid}")
+    print(f"   Condition number: {diag.get('condition_number', 'N/A'):.2e}")
+    if is_valid:
+        print(f"   MSE(μx,μy): {diag['mse_pointing']:.2e} rad²")
+        print(f"   σ(μx,μy): {np.sqrt(diag['mse_pointing']):.2e} rad")
+
+    print(f"\n{'=' * 60}\n")
