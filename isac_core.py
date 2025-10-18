@@ -496,12 +496,13 @@ def physical_background_model(sun_angle_deg, fov_urad,
                               dt_slot=2e-6,
                               config=None):
     """
-    完整物理背景模型（唯一实现）
+    完整物理背景模型（修复版）
 
     ✅ 修复要点：
     1. fov_rad = fov_urad * 1e-6（μrad转rad）
     2. Ω = π*(fov_rad/2)^2（立体角）
-    3. 返回λ_b在10^-2~10^1 photons/slot范围
+    3. ⭐ 地球照使用min(omega_earth, omega_fov)限制
+    4. 返回λ_b在10^-2~10^1 photons/slot范围
 
     参数:
         sun_angle_deg: 太阳避让角 [degrees]
@@ -571,20 +572,23 @@ def physical_background_model(sun_angle_deg, fov_urad,
         else:
             return ref_points[60] * (60 / theta_deg) ** 3
 
-    # 1. 太阳杂散光
+    # 1. 太阳散射光
     pst = pst_function(sun_angle_deg, performance=pst_class)
     L_stray = (SSI_1550nm * pst) / omega_fov  # W·m⁻²·sr⁻¹·nm⁻¹
     P_solar = L_stray * A_eff * omega_fov * (Delta_lambda * 1e9) * tau_optics  # W
     lambda_solar_rate = P_solar / E_photon  # photons/s
 
-    # 2. 地球照
+    # 2. 地球照（⭐ 修复版）
     if orbit_params is not None:
         altitude_km = orbit_params.get('altitude_km', 600)
         earth_phase = orbit_params.get('earth_phase_angle_deg', 90)
 
         R_earth = 6371
         theta_earth = np.arctan(R_earth / altitude_km)
-        omega_earth = 2 * np.pi * (1 - np.cos(theta_earth))
+        omega_earth_full = 2 * np.pi * (1 - np.cos(theta_earth))
+
+        # ⭐⭐⭐ 关键修复：地球照应该被接收机视场限制
+        omega_earth_visible = min(omega_earth_full, omega_fov)
 
         alpha_composite = (
                 0.71 * (1 - cloud_cover) * albedo_ocean +
@@ -594,11 +598,16 @@ def physical_background_model(sun_angle_deg, fov_urad,
 
         phase_factor = np.cos(np.radians(earth_phase)) * 0.5 + 0.5
         L_earthshine = (alpha_composite * SSI_1550nm / np.pi) * phase_factor
-        P_earth = L_earthshine * A_eff * omega_earth * (Delta_lambda * 1e9) * tau_optics
+
+        # ⭐ 使用受限的立体角
+        P_earth = L_earthshine * A_eff * omega_earth_visible * (Delta_lambda * 1e9) * tau_optics
         lambda_earthshine_rate = P_earth / E_photon
     else:
+        # 如果没有轨道参数，使用经验值
         lambda_earthshine_rate = 0.5 * lambda_solar_rate
         L_earthshine = None
+        omega_earth_full = None
+        omega_earth_visible = None
 
     # 3. 黄道光
     L_zodiacal_base = zodiacal_base
@@ -622,6 +631,8 @@ def physical_background_model(sun_angle_deg, fov_urad,
         'L_earthshine': L_earthshine,
         'L_zodiacal': L_zodiacal,
         'omega_fov': omega_fov,
+        'omega_earth_full': omega_earth_full,
+        'omega_earth_visible': omega_earth_visible,
         'fov_rad': fov_rad,
     }
 
