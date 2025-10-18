@@ -323,7 +323,9 @@ def _figure2_scenario_worker(args):
         Smax_eff = params['Smax']
 
     # 固定pilot幅度（Assumption A2）
-    A_pilot_use = min(Smax_eff, 4.0 * params['Sbar']) * 0.8
+    A_pilot_base = max(4.0 * params['Sbar'], params['Sbar'])
+    A_pilot_use = min(Smax_eff, A_pilot_base) * 0.8
+    A_pilot_use = max(A_pilot_use, 0.2 * Smax_eff)  # 确保不低于峰值的20%
 
     mse_grid = np.zeros((len(rho_range), len(alpha_range)))
     valid_count = 0
