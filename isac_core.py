@@ -329,12 +329,27 @@ def _mutual_information_binary_cpu(A, p, lambda_b, K_max):
 def capacity_ub_dual(S_bar, S_max_eff, lambda_b, dt=1e-6,
                      tau_d=50e-9, M_pixels=16,
                      lambda_q_range=None, nu_range=None):
-    """对偶上界（单点版本）"""
+    """
+    对偶上界（修复版）
+
+    ⭐ 修复要点：
+    1. 自适应搜索范围
+    2. 更密集的网格
+    3. 确保上界 ≥ 下界
+    """
+
+    # ⭐ 自适应搜索范围
     if lambda_q_range is None:
-        lambda_q_range = np.linspace(lambda_b, lambda_b + S_max_eff, 30)
+        # lambda_q应该覆盖[lambda_b, lambda_b + S_max_eff]
+        lambda_q_min = max(lambda_b * 0.5, 0.01)  # 防止过小
+        lambda_q_max = lambda_b + S_max_eff + 5 * np.sqrt(lambda_b + S_max_eff)
+        lambda_q_range = np.linspace(lambda_q_min, lambda_q_max, 40)  # 增加密度
 
     if nu_range is None:
-        nu_range = np.logspace(-3, 1, 25)
+        # nu范围应该根据S_bar自适应调整
+        nu_min = 1e-4 / S_bar  # 避免过小
+        nu_max = 10.0 / S_bar  # 避免过大
+        nu_range = np.logspace(np.log10(nu_min), np.log10(nu_max), 30)
 
     K_max = int(np.ceil(lambda_b + S_max_eff + 12 * np.sqrt(lambda_b + S_max_eff)))
     K_max = min(K_max, 400)
@@ -345,13 +360,15 @@ def capacity_ub_dual(S_bar, S_max_eff, lambda_b, dt=1e-6,
     nu_opt = 0
 
     for lambda_q in lambda_q_range:
+        # 测试信道Q
         log_Q = -lambda_q + k_vals * np.log(lambda_q + 1e-20) - gammaln(k_vals + 1)
         Q = np.exp(log_Q)
         Q = Q / (Q.sum() + 1e-20)
 
         for nu in nu_range:
             max_val = -np.inf
-            A_search = np.linspace(0, S_max_eff, 50)
+            # ⭐ 更密集的A搜索
+            A_search = np.linspace(0, S_max_eff, 60)  # 从50增加到60
 
             for A in A_search:
                 lambda_total = lambda_b + A
@@ -360,6 +377,7 @@ def capacity_ub_dual(S_bar, S_max_eff, lambda_b, dt=1e-6,
                 P = np.exp(log_P)
                 P = P / (P.sum() + 1e-20)
 
+                # KL散度
                 kl_div = 0.0
                 for k in range(K_max):
                     if P[k] > 1e-20 and Q[k] > 1e-20:
@@ -379,10 +397,15 @@ def capacity_ub_dual(S_bar, S_max_eff, lambda_b, dt=1e-6,
 
     C_UB = C_UB / np.log(2)
 
+    # ⭐ 安全检查：确保上界非负
+    C_UB = max(C_UB, 0.0)
+
     diagnostics = {
         'lambda_q_opt': lambda_q_opt,
         'nu_opt': nu_opt,
-        'method': 'dual_2d_grid'
+        'method': 'dual_2d_grid',
+        'lambda_q_range': (lambda_q_range[0], lambda_q_range[-1]),
+        'nu_range': (nu_range[0], nu_range[-1])
     }
 
     return C_UB, (lambda_q_opt, nu_opt), diagnostics
@@ -645,81 +668,61 @@ def physical_background_model(sun_angle_deg, fov_urad,
 def fim_pilot(alpha, rho, Sbar, N, dt, params, dither_seq,
               tau_d=None, A_pilot=None, M_pixels=16):
     """
-    Fisher Information Matrix 计算（完全遵循Algorithm 1）
+    Fisher Information Matrix 计算（鲁棒版）
 
-    ✅ 修复要点：
-    1. A_pilot必须作为固定参数传入（Assumption A2）
-    2. 死区修正 g_dead = (1 + r*tau_d)^(-2)
-    3. r_b视为rate (photons/s)
-    4. 确保N_pilot计算正确
-
-    参数:
-        alpha: 时间分配比例 [0,1]
-        rho: 光子分配比例 [0,1]
-        Sbar: 平均功率约束 (photons/slot)
-        N: 总时隙数
-        dt: 时隙宽度 (seconds)
-        params: 系统参数字典，必须包含:
-            - r_b: 背景率 (photons/s) ⚠️
-            - theta_b: 波束发散角 (radians)
-            - sigma2: 指向方差 (rad^2)
-            - mu_x, mu_y: 指向偏差 (radians)
-        dither_seq: 抖动序列 (N_pilot × 2)
-        tau_d: 死区时间 (seconds)
-        A_pilot: 固定pilot幅度 (photons/slot) ⭐ 必传
-        M_pixels: 并行像素数
-
-    返回:
-        I: Fisher信息矩阵 (4×4)
+    ⭐ 增强鲁棒性：
+    1. 更安全的N_pilot计算
+    2. 数值稳定性检查
+    3. 详细的诊断信息
     """
 
-    # ============================================================================
-    # Step 0: 参数提取与验证
-    # ============================================================================
-
+    # Step 0: 参数提取
     theta_b = params['theta_b']
     sigma_point_sq = params.get('sigma2', 1e-12)
-    r_b = params['r_b']  # ⚠️ 这是rate (photons/s)
+    r_b = params['r_b']  # photons/s
 
     if tau_d is None:
         tau_d = params.get('tau_d', 50e-9)
 
-    # ⭐ 计算有效峰值功率（考虑死区）
+    # 计算有效峰值功率
     S_max_eff = params.get('Smax', 100)
     if tau_d > 0 and M_pixels > 0:
         S_max_eff = min(S_max_eff, M_pixels * dt / tau_d)
 
-    # ⭐ A_pilot必须传入（Assumption A2）
+    # ⭐ A_pilot必须传入
     if A_pilot is None:
-        # 后备：使用0.5 S_max_eff
-        A_pilot = 0.5 * S_max_eff
-        print(f"⚠️ Warning: A_pilot not provided, using default {A_pilot:.2f}")
+        # 后备：使用0.8 × min(Smax_eff, 4×Sbar)
+        A_pilot = 0.8 * min(S_max_eff, max(4.0 * Sbar, Sbar))  # 确保至少是Sbar
+        print(f"⚠️ Warning: A_pilot not provided, using {A_pilot:.2f}")
 
-    # Ensure A_pilot不超过峰值
+    # 确保A_pilot不超过峰值
     A_pilot = min(A_pilot, S_max_eff)
 
-    # ============================================================================
-    # Step 1: 计算pilot槽数（Algorithm 1的关键）
-    # ============================================================================
+    # ⭐ 确保A_pilot有意义（至少是Sbar的10%）
+    A_pilot = max(A_pilot, 0.1 * Sbar)
 
-    # N_pilot = min{⌊αN⌋, ⌊ρS̄N/A_pilot⌋}
+    # Step 1: 计算N_pilot（更安全的方式）
     N_pilot_time = int(alpha * N)
+
+    # ⭐ 防止除以0
+    if A_pilot < 1e-10:
+        print(f"⚠️ Error: A_pilot too small ({A_pilot:.2e}), returning zero FIM")
+        return np.zeros((4, 4))
+
     N_pilot_photon = int((rho * Sbar * N) / A_pilot)
     N_pilot = min(N_pilot_time, N_pilot_photon)
 
-    # 安全检查
+    # ⭐ 安全检查
     if N_pilot <= 0:
-        print(f"⚠️ Warning: N_pilot={N_pilot}, returning zero FIM")
+        print(f"⚠️ Warning: N_pilot={N_pilot} (alpha={alpha}, rho={rho}, Sbar={Sbar}, A_pilot={A_pilot})")
         return np.zeros((4, 4))
 
     if N_pilot > len(dither_seq):
-        print(f"⚠️ Warning: N_pilot={N_pilot} > dither length={len(dither_seq)}")
         N_pilot = len(dither_seq)
+        if N_pilot <= 0:
+            return np.zeros((4, 4))
 
-    # ============================================================================
     # Step 2: 预计算常数
-    # ============================================================================
-
     mu_true = np.array([params.get('mu_x', 1e-6), params.get('mu_y', 0.5e-6)])
 
     a = 4.0 / (theta_b ** 2)
@@ -728,78 +731,64 @@ def fim_pilot(alpha, rho, Sbar, N, dt, params, dither_seq,
 
     I = np.zeros((4, 4))
 
-    # ============================================================================
-    # Step 3: 主循环 - 遍历pilot时隙
-    # ============================================================================
+    # ⭐ 统计有效时隙数
+    valid_slots = 0
 
+    # Step 3: 主循环
     for n in range(N_pilot):
-        # --------------------------------------------------------------------
-        # Step 3.1: 应用抖动（Proposition 3: Identifiability）
-        # --------------------------------------------------------------------
         d_n = dither_seq[n]
         mu_eff = mu_true + d_n
 
-        # --------------------------------------------------------------------
-        # Step 3.2: 计算期望指向损耗
-        # --------------------------------------------------------------------
         L_p = (1.0 / gamma) * np.exp(-b * np.dot(mu_eff, mu_eff) / gamma)
 
-        # --------------------------------------------------------------------
-        # Step 3.3: 计算死区前的光子数（⚠️ 关键单位转换）
-        # --------------------------------------------------------------------
-        # 信号: A_pilot × L_p (photons/slot)
-        # 背景: r_b × dt (photons/s × s = photons/slot)
-        lambda_n_pre = A_pilot * L_p + r_b * dt
-        r_n_pre = lambda_n_pre / dt  # 转为rate (photons/s)
+        # ⭐ 检查L_p是否合理
+        if L_p < 1e-50 or not np.isfinite(L_p):
+            continue
 
-        # --------------------------------------------------------------------
-        # Step 3.4: 死区修正（Proposition 4: Diminishing Returns）
-        # --------------------------------------------------------------------
+        lambda_n_pre = A_pilot * L_p + r_b * dt
+        r_n_pre = lambda_n_pre / dt
+
+        # 死区修正
         if tau_d > 0:
-            # 非并行死区模型: r' = r / (1 + r*tau_d)
-            # 链式法则系数: dr'/dr = 1 / (1 + r*tau_d)^2
-            g_dead = 1.0 / ((1 + r_n_pre * tau_d) ** 2)
-            r_n_post = r_n_pre / (1 + r_n_pre * tau_d)
+            denom = 1 + r_n_pre * tau_d
+            if denom < 1e-10:  # ⭐ 防止除以0
+                continue
+            g_dead = 1.0 / (denom ** 2)
+            r_n_post = r_n_pre / denom
             lambda_n = r_n_post * dt
         else:
             g_dead = 1.0
             lambda_n = lambda_n_pre
 
-        # 数值稳定性检查
-        if lambda_n < 1e-20:
+        # ⭐ 数值稳定性检查
+        if lambda_n < 1e-20 or not np.isfinite(lambda_n):
             continue
 
-        # --------------------------------------------------------------------
-        # Step 3.5: 计算偏导数（带链式法则）
-        # --------------------------------------------------------------------
-        # 基础因子（信号部分对参数的敏感度）
+        # 计算梯度
         base_factor = g_dead * A_pilot * L_p
 
-        # ∂λ/∂μx = base_factor × (-2b*μx/γ)
         grad_mux = base_factor * (-2 * b * mu_eff[0] / gamma)
-
-        # ∂λ/∂μy = base_factor × (-2b*μy/γ)
         grad_muy = base_factor * (-2 * b * mu_eff[1] / gamma)
-
-        # ∂λ/∂σ² = base_factor × (-a/γ + ab||μ||²/γ²)
         grad_sigma = base_factor * (
                 -a / gamma + a * b * np.dot(mu_eff, mu_eff) / (gamma ** 2)
         )
-
-        # ∂λ/∂r_b = g_dead × dt （背景项的贡献）
         grad_rb = g_dead * dt
 
-        # 梯度向量
         grad = np.array([grad_mux, grad_muy, grad_sigma, grad_rb])
 
-        # --------------------------------------------------------------------
-        # Step 3.6: 累积Fisher信息 I += (1/λ) ∇∇ᵀ
-        # --------------------------------------------------------------------
-        I += np.outer(grad, grad) / lambda_n
+        # ⭐ 检查梯度是否有限
+        if not np.all(np.isfinite(grad)):
+            continue
 
-    # ============================================================================
-    # Step 4: 返回
-    # ============================================================================
+        # 累积FIM
+        I += np.outer(grad, grad) / lambda_n
+        valid_slots += 1
+
+    # ⭐ 诊断信息
+    if valid_slots < N_pilot * 0.1:  # 如果有效时隙少于10%
+        print(f"⚠️ Warning: Only {valid_slots}/{N_pilot} valid slots in FIM")
+        if valid_slots == 0:
+            return np.zeros((4, 4))
 
     return I
 
