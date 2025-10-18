@@ -94,21 +94,16 @@ def set_reproducibility(seed=42):
 
 def generate_figure_1_enhanced(config, dirs):
     """
-    生成 Fig_1_Capacity_Bounds_Fixed.pdf
-
-    ⭐ 修复内容：
-    1. 红虚线改为真正的对偶上界（Dual UB）
-    2. 蓝实线保持二元输入下界（Binary LB）
-    3. 显示真实的上下界差距（Gap 应在 0.05-0.2 bits/slot）
+    生成 Fig_1_Capacity_Bounds_Fixed.pdf（GPU加速版）
     """
     print("\n" + "=" * 60)
-    print("📊 FIGURE 1: 容量界对比（修复版）")
+    print("📊 FIGURE 1: 容量界对比（GPU加速版）")
     print("=" * 60)
 
     colors = setup_ieee_style()
 
     # 参数
-    lambda_b_range = np.logspace(-2, 2, 40)  # 背景范围
+    lambda_b_range = np.logspace(-2, 2, 40)
     signal_budgets = config['simulation']['signal_budgets']
     hardware_config = config['hardware_platforms']['short_dead_time']
 
@@ -130,58 +125,55 @@ def generate_figure_1_enhanced(config, dirs):
         ax = axes[idx]
 
         print(f"\n  📈 S̄ = {S_bar} photons/slot")
+        start_time = time.time()
 
-        capacities_lb = []
-        capacities_ub = []
-        capacities_discrete = []  # 可选：显示离散输入容量
-        gaps = []
+        # ⭐ GPU 批量计算
+        print(f"    🚀 GPU批量计算 {len(lambda_b_range)} 个点...")
 
-        for i, lambda_b in enumerate(tqdm(lambda_b_range, desc=f"    处理")):
-            # 下界：二元输入
-            C_lb, _ = capacity_lb(S_bar, S_max_eff, lambda_b, dt, tau_d, M_pixels)
-            capacities_lb.append(C_lb)
+        # 下界：批量计算
+        capacities_lb, _ = capacity_lb_batch_gpu(
+            S_bar, S_max_eff, lambda_b_range, dt, tau_d, M_pixels
+        )
 
-            # 上界：对偶公式 ⭐ 关键修复
+        # 上界：批量计算
+        capacities_ub = capacity_ub_dual_batch_gpu(
+            S_bar, S_max_eff, lambda_b_range, dt, tau_d, M_pixels
+        )
+
+        # 离散输入容量（稀疏采样）
+        capacities_discrete = []
+        lambda_b_discrete = []
+        for i in range(0, len(lambda_b_range), 5):
+            lambda_b = lambda_b_range[i]
             try:
-                C_ub, _, _ = capacity_ub_dual(
-                    S_bar, S_max_eff, lambda_b, dt, tau_d, M_pixels
+                C_disc, _, _ = capacity_discrete_input(
+                    S_bar, S_max_eff, lambda_b, dt, tau_d, M_pixels,
+                    max_iter=100
                 )
-                capacities_ub.append(C_ub)
-                gap = C_ub - C_lb
-                gaps.append(gap)
-            except Exception as e:
-                print(f"      ⚠️  λ_b={lambda_b:.2e} 上界计算失败: {e}")
-                capacities_ub.append(C_lb)
-                gaps.append(0.0)
+                capacities_discrete.append(C_disc)
+                lambda_b_discrete.append(lambda_b)
+            except:
+                pass
 
-            # 可选：离散输入容量（介于上下界之间）
-            if i % 5 == 0:  # 每5个点计算一次（节省时间）
-                try:
-                    C_disc, _, _ = capacity_discrete_input(
-                        S_bar, S_max_eff, lambda_b, dt, tau_d, M_pixels,
-                        max_iter=100
-                    )
-                    capacities_discrete.append((lambda_b, C_disc))
-                except:
-                    pass
+        elapsed = time.time() - start_time
+        print(f"    ✅ 完成，耗时 {elapsed:.2f} 秒")
+
+        # 计算Gap
+        gaps = capacities_ub - capacities_lb
+        valid_gaps = gaps[(gaps > 0) & (gaps < 1)]
+        avg_gap = np.mean(valid_gaps) if len(valid_gaps) > 0 else 0
 
         # 绘图
-        # 下界：蓝色实线
         ax.semilogx(lambda_b_range, capacities_lb, 'b-', linewidth=2.5,
-                    label=f'Lower Bound (Binary Input)')
+                    label='Lower Bound (Binary Input)')
 
-        # 上界：红色虚线 ⭐ 正确的上界
         ax.semilogx(lambda_b_range, capacities_ub, 'r--', linewidth=2,
-                    label=f'Upper Bound (Dual Formula)')
+                    label='Upper Bound (Dual Formula)')
 
-        # 可选：离散输入容量（绿色点）
         if capacities_discrete:
-            lambda_b_disc = [x[0] for x in capacities_discrete]
-            C_disc_vals = [x[1] for x in capacities_discrete]
-            ax.semilogx(lambda_b_disc, C_disc_vals, 'g.', markersize=8,
+            ax.semilogx(lambda_b_discrete, capacities_discrete, 'g.', markersize=8,
                         label='Discrete-input capacity (AB)')
 
-        # 填充差距区域
         ax.fill_between(lambda_b_range, capacities_lb, capacities_ub,
                         alpha=0.2, color='gray', label='Achievability Gap')
 
@@ -193,10 +185,6 @@ def generate_figure_1_enhanced(config, dirs):
         ax.axvline(x=10.0, color='red', alpha=0.3, linestyle=':',
                    label='Stray Light' if idx == 0 else "")
 
-        # 计算平均差距
-        valid_gaps = [g for g in gaps if 0 < g < 1]  # 排除异常值
-        avg_gap = np.mean(valid_gaps) if valid_gaps else 0
-
         ax.set_xlabel('Background λ_b [photons/slot]', fontweight='bold')
         ax.set_ylabel('Capacity [bits/slot]', fontweight='bold')
         ax.set_title(f'S̄ = {S_bar} photons/slot\n(Avg Gap: {avg_gap:.4f} bits/slot)',
@@ -204,7 +192,7 @@ def generate_figure_1_enhanced(config, dirs):
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8, loc='best')
 
-        print(f"    ✅ 平均差距：{avg_gap:.4f} bits/slot")
+        print(f"    📊 平均差距：{avg_gap:.4f} bits/slot")
 
     plt.tight_layout()
 
@@ -215,8 +203,6 @@ def generate_figure_1_enhanced(config, dirs):
     plt.close()
 
     print(f"\n✅ 保存：{output_path}.pdf")
-    print(f"   预期：上下界有可见差距（Gap ≈ 0.05-0.2 bits/slot）")
-
 
 # ============================================================================
 # ENHANCED FIGURE 4: PHYSICAL BACKGROUND MODEL
@@ -272,7 +258,8 @@ def generate_figure_4_physical(config, dirs):
                 Sun_grid[i, j],
                 FoV_grid[i, j],
                 orbit_params=orbit_params,
-                dt_slot=dt  # ⭐ 使用正确的时隙持续时间
+                dt_slot=dt,
+                config=config  # ⭐ 传入配置
             )
 
             Background_grid[i, j] = lambda_b

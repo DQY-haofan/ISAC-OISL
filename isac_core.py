@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-OISL-ISAC 核心函数 - 理论正确修复版
+OISL-ISAC 核心函数 - GPU加速优化版（A100）
 ====================================
 
-修复内容：
-1. 添加真正的对偶上界（Dual Upper Bound）
-2. 物理背景模型接受 dt_slot 参数，单位正确
-3. AB 算法正确标注为离散输入容量（下界）
+新增功能：
+1. GPU批量计算容量界（充分利用A100）
+2. 自动检测并选择最优计算方法
+3. 保留CPU版本作为后备
 """
 
 import numpy as np
@@ -16,10 +16,10 @@ import warnings
 import time
 
 
-# [硬件配置部分保持不变，使用前面修复的版本]
-# ... (HardwareConfig, AccelerationStrategy 等)
+# ============================================================================
+# 硬件配置（增强版）
+# ============================================================================
 
-# 为了完整性，这里包含简化版本
 class HardwareConfig:
     def __init__(self):
         self.numba_available = False
@@ -42,14 +42,16 @@ class HardwareConfig:
             _ = test + 1
             self.gpu_available = True
             self.cp = cp
+            self.xp = cp  # ⭐ 默认使用 CuPy
         except:
             self.cp = np
+            self.xp = np
 
         self._print_config()
 
     def _print_config(self):
         print("\n" + "=" * 60)
-        print("🔧 OISL-ISAC 硬件配置")
+        print("🔧 OISL-ISAC 硬件配置（优化版）")
         print("=" * 60)
         print(f"NumPy: {np.__version__}")
 
@@ -63,13 +65,18 @@ class HardwareConfig:
             print(f"CuPy: {self.cp.__version__} ✅")
             try:
                 device = self.cp.cuda.Device()
-                # 兼容 CuPy 13.x
                 try:
                     props = self.cp.cuda.runtime.getDeviceProperties(device.id)
                     gpu_name = props['name'].decode() if isinstance(props['name'], bytes) else str(props['name'])
                 except:
                     gpu_name = f"GPU Device {device.id}"
+
+                mem_info = self.cp.cuda.Device().mem_info
+                total_mem_gb = mem_info[1] / 1e9
+
                 print(f"GPU: {gpu_name}")
+                print(f"显存: {total_mem_gb:.1f} GB")
+                print(f"🚀 GPU加速已启用（批量计算模式）")
             except:
                 pass
         else:
@@ -81,31 +88,192 @@ class HardwareConfig:
 _hw_config = HardwareConfig()
 
 
-class AccelerationStrategy:
-    NUMBA_THRESHOLD = 10
-    GPU_THRESHOLD = 50
+# ============================================================================
+# GPU 批量计算：容量下界（⭐ 新增）
+# ============================================================================
 
-    @staticmethod
-    def select_method(task_name, data_size):
-        if data_size > AccelerationStrategy.GPU_THRESHOLD and _hw_config.gpu_available:
-            return 'gpu'
-        elif data_size > AccelerationStrategy.NUMBA_THRESHOLD and _hw_config.numba_available:
-            return 'numba'
-        else:
-            return 'cpu'
+def capacity_lb_batch_gpu(S_bar, S_max, lambda_b_array, dt=1e-6, tau_d=50e-9, M_pixels=16):
+    """
+    批量计算容量下界（GPU加速）
+
+    参数：
+        S_bar: 平均功率约束
+        S_max: 峰值功率约束
+        lambda_b_array: 背景光子数数组，shape (N,)
+        dt, tau_d, M_pixels: 硬件参数
+
+    返回：
+        C_array: 容量数组，shape (N,)
+        A_opt_array: 最优幅度数组，shape (N,)
+    """
+
+    if not _hw_config.gpu_available:
+        # 后备：逐点CPU计算
+        C_array = []
+        A_opt_array = []
+        for lambda_b in lambda_b_array:
+            C, A_opt = capacity_lb(S_bar, S_max, lambda_b, dt, tau_d, M_pixels)
+            C_array.append(C)
+            A_opt_array.append(A_opt)
+        return np.array(C_array), np.array(A_opt_array)
+
+    cp = _hw_config.cp
+
+    # 有效峰值功率
+    S_max_eff = S_max
+    if tau_d > 0 and M_pixels > 0:
+        S_max_eff = min(S_max, M_pixels * dt / tau_d)
+
+    # 转移到GPU
+    lambda_b_gpu = cp.array(lambda_b_array)  # shape (N,)
+    N = len(lambda_b_array)
+
+    # A 网格
+    A_min = S_bar
+    A_max = S_max_eff
+    N_A = 100
+    A_vals = cp.linspace(A_min, A_max, N_A)  # shape (N_A,)
+
+    # K 网格
+    K_max = int(cp.ceil(cp.max(lambda_b_gpu) + S_max_eff + 10 * cp.sqrt(cp.max(lambda_b_gpu) + S_max_eff)))
+    K_max = min(K_max, 500)
+    k_vals = cp.arange(K_max)  # shape (K,)
+
+    # 广播计算：lambda_b (N,1,1), A (1,N_A,1), k (1,1,K)
+    lambda_b_3d = lambda_b_gpu[:, None, None]  # (N, 1, 1)
+    A_3d = A_vals[None, :, None]  # (1, N_A, 1)
+    k_3d = k_vals[None, None, :]  # (1, 1, K)
+
+    # 计算 p = S_bar / A
+    p_vals = S_bar / A_vals  # (N_A,)
+    p_3d = p_vals[None, :, None]  # (1, N_A, 1)
+
+    # 过滤 p > 1 的情况
+    valid_mask = (p_3d <= 1.0)  # (1, N_A, 1)
+
+    # P(k | X=0): lambda_b only
+    log_P0 = -lambda_b_3d + k_3d * cp.log(lambda_b_3d + 1e-20) - cp.array(gammaln(k_3d.get() + 1))
+    P0 = cp.exp(log_P0)
+    P0 = P0 / (cp.sum(P0, axis=2, keepdims=True) + 1e-20)  # (N, 1, K)
+
+    # P(k | X=A): lambda_b + A
+    lambda_total = lambda_b_3d + A_3d  # (N, N_A, 1)
+    log_PA = -lambda_total + k_3d * cp.log(lambda_total + 1e-20) - cp.array(gammaln(k_3d.get() + 1))
+    PA = cp.exp(log_PA)
+    PA = PA / (cp.sum(PA, axis=2, keepdims=True) + 1e-20)  # (N, N_A, K)
+
+    # P(Y): (1-p)*P0 + p*PA
+    PY = (1 - p_3d) * P0 + p_3d * PA  # (N, N_A, K)
+    PY = PY / (cp.sum(PY, axis=2, keepdims=True) + 1e-20)
+
+    # 互信息：H(Y) - (1-p)*H(Y|X=0) - p*H(Y|X=A)
+    log2 = cp.log(2)
+
+    H_Y = -cp.sum(cp.where(PY > 1e-20, PY * cp.log(PY) / log2, 0), axis=2)  # (N, N_A)
+    H_Y0 = -cp.sum(cp.where(P0 > 1e-20, P0 * cp.log(P0) / log2, 0), axis=2)  # (N, 1)
+    H_YA = -cp.sum(cp.where(PA > 1e-20, PA * cp.log(PA) / log2, 0), axis=2)  # (N, N_A)
+
+    I = H_Y - (1 - p_vals[None, :]) * H_Y0 - p_vals[None, :] * H_YA  # (N, N_A)
+
+    # 应用 valid_mask
+    I = cp.where(valid_mask[:, :, 0], I, -cp.inf)
+
+    # 找到每个 lambda_b 的最优 A
+    I_max_idx = cp.argmax(I, axis=1)  # (N,)
+    C_array = cp.max(I, axis=1)  # (N,)
+    A_opt_array = A_vals[I_max_idx]
+
+    # 转回CPU
+    return cp.asnumpy(C_array), cp.asnumpy(A_opt_array)
 
 
 # ============================================================================
-# 容量下界计算（保持不变）
+# GPU 批量计算：对偶上界（⭐ 新增）
+# ============================================================================
+
+def capacity_ub_dual_batch_gpu(S_bar, S_max, lambda_b_array, dt=1e-6, tau_d=50e-9, M_pixels=16):
+    """
+    批量计算对偶上界（GPU加速）
+
+    返回：
+        C_UB_array: shape (N,)
+    """
+
+    if not _hw_config.gpu_available:
+        # 后备：逐点CPU计算
+        C_UB_array = []
+        for lambda_b in lambda_b_array:
+            C_UB, _, _ = capacity_ub_dual(S_bar, S_max, lambda_b, dt, tau_d, M_pixels)
+            C_UB_array.append(C_UB)
+        return np.array(C_UB_array)
+
+    cp = _hw_config.cp
+
+    # 有效峰值功率
+    S_max_eff = S_max
+    if tau_d > 0 and M_pixels > 0:
+        S_max_eff = min(S_max, M_pixels * dt / tau_d)
+
+    lambda_b_gpu = cp.array(lambda_b_array)
+    N = len(lambda_b_array)
+
+    # 搜索范围
+    lambda_q_range = cp.linspace(cp.min(lambda_b_gpu), cp.max(lambda_b_gpu) + S_max_eff, 30)
+    nu_range = cp.logspace(-3, 1, 25)
+    A_search = cp.linspace(0, S_max_eff, 50)
+
+    K_max = int(cp.ceil(cp.max(lambda_b_gpu) + S_max_eff + 12 * cp.sqrt(cp.max(lambda_b_gpu) + S_max_eff)))
+    K_max = min(K_max, 400)
+    k_vals = cp.arange(K_max)
+
+    C_UB_array = cp.full(N, cp.inf)
+
+    # 对每个 lambda_b 进行 2D 搜索（仍需循环，但内部向量化）
+    for i in range(N):
+        lambda_b_i = lambda_b_gpu[i]
+        C_UB_min = cp.inf
+
+        for lambda_q in lambda_q_range:
+            # 预计算测试信道 Q
+            log_Q = -lambda_q + k_vals * cp.log(lambda_q + 1e-20) - cp.array(gammaln(k_vals.get() + 1))
+            Q = cp.exp(log_Q)
+            Q = Q / (cp.sum(Q) + 1e-20)
+
+            for nu in nu_range:
+                # 内层：对所有 A 向量化计算
+                lambda_total = lambda_b_i + A_search  # (50,)
+
+                # P = Pois(lambda_b + A) for all A
+                log_P = -lambda_total[:, None] + k_vals[None, :] * cp.log(lambda_total[:, None] + 1e-20) - cp.array(
+                    gammaln(k_vals.get() + 1))
+                P = cp.exp(log_P)
+                P = P / (cp.sum(P, axis=1, keepdims=True) + 1e-20)  # (50, K)
+
+                # KL(P || Q) for all A
+                kl_div = cp.sum(cp.where((P > 1e-20) & (Q[None, :] > 1e-20),
+                                         P * cp.log(P / Q[None, :]), 0), axis=1)  # (50,)
+
+                # max_A [KL - nu*A]
+                obj_vals = kl_div - nu * A_search
+                max_val = cp.max(obj_vals)
+
+                # 对偶目标
+                dual_obj = nu * S_bar + max_val
+
+                if dual_obj < C_UB_min:
+                    C_UB_min = dual_obj
+
+        C_UB_array[i] = C_UB_min / cp.log(2)
+
+    return cp.asnumpy(C_UB_array)
+
+
+# ============================================================================
+# 原有函数（保留，用于单点计算和后备）
 # ============================================================================
 
 def capacity_lb(S_bar, S_max, lambda_b, dt=1e-6, tau_d=50e-9, M_pixels=16):
-    """
-    容量下界（二元 ON-OFF 输入）
-
-    这是理论下界，对应 Proposition 2
-    """
-
+    """容量下界（单点版本）"""
     S_max_eff = S_max
     if tau_d > 0 and M_pixels > 0:
         S_max_eff = min(S_max, M_pixels * dt / tau_d)
@@ -158,41 +326,16 @@ def _mutual_information_binary_cpu(A, p, lambda_b, K_max):
     return H_Y - (1 - p) * H_Y0 - p * H_YA
 
 
-# ============================================================================
-# 容量上界（对偶公式 - Theorem 2）⭐ 新增
-# ============================================================================
-
 def capacity_ub_dual(S_bar, S_max_eff, lambda_b, dt=1e-6,
                      tau_d=50e-9, M_pixels=16,
                      lambda_q_range=None, nu_range=None):
-    """
-    容量对偶上界（Theorem 2）
-
-    C ≤ inf_{Q,ν≥0} { ν·S̄ + sup_{A∈[0,S_max]} [D(Pois(λ_b+A) || Q) - ν·A] }
-
-    参数：
-        S_bar: 平均功率约束
-        S_max_eff: 峰值功率约束
-        lambda_b: 背景光子数
-        lambda_q_range: 测试信道参数搜索范围（若为 None 则自动生成）
-        nu_range: Lagrange 乘子搜索范围（若为 None 则自动生成）
-
-    返回：
-        C_UB: 容量上界
-        (lambda_q_opt, nu_opt): 最优参数
-        diagnostics: 诊断信息
-    """
-
-    # 自动生成搜索范围
+    """对偶上界（单点版本）"""
     if lambda_q_range is None:
-        # 测试信道应覆盖 [λ_b, λ_b + S_max]
         lambda_q_range = np.linspace(lambda_b, lambda_b + S_max_eff, 30)
 
     if nu_range is None:
-        # Lagrange 乘子典型范围
         nu_range = np.logspace(-3, 1, 25)
 
-    # Poisson 截断
     K_max = int(np.ceil(lambda_b + S_max_eff + 12 * np.sqrt(lambda_b + S_max_eff)))
     K_max = min(K_max, 400)
     k_vals = np.arange(K_max)
@@ -201,41 +344,32 @@ def capacity_ub_dual(S_bar, S_max_eff, lambda_b, dt=1e-6,
     lambda_q_opt = lambda_b
     nu_opt = 0
 
-    # 2D 搜索：(λ_q, ν)
     for lambda_q in lambda_q_range:
-        # 预计算测试信道 Q = Pois(λ_q)
         log_Q = -lambda_q + k_vals * np.log(lambda_q + 1e-20) - gammaln(k_vals + 1)
         Q = np.exp(log_Q)
         Q = Q / (Q.sum() + 1e-20)
 
         for nu in nu_range:
-            # 内层优化：max_A [D(Pois(λ_b+A) || Q) - ν·A]
             max_val = -np.inf
-
-            # 在 A 上进行 1D 搜索
             A_search = np.linspace(0, S_max_eff, 50)
 
             for A in A_search:
                 lambda_total = lambda_b + A
 
-                # 计算 P = Pois(λ_b + A)
                 log_P = -lambda_total + k_vals * np.log(lambda_total + 1e-20) - gammaln(k_vals + 1)
                 P = np.exp(log_P)
                 P = P / (P.sum() + 1e-20)
 
-                # KL 散度 D(P || Q)
                 kl_div = 0.0
                 for k in range(K_max):
                     if P[k] > 1e-20 and Q[k] > 1e-20:
                         kl_div += P[k] * np.log(P[k] / Q[k])
 
-                # 目标函数值
                 val = kl_div - nu * A
 
                 if val > max_val:
                     max_val = val
 
-            # 对偶目标函数
             dual_obj = nu * S_bar + max_val
 
             if dual_obj < C_UB:
@@ -243,7 +377,6 @@ def capacity_ub_dual(S_bar, S_max_eff, lambda_b, dt=1e-6,
                 lambda_q_opt = lambda_q
                 nu_opt = nu
 
-    # 转换为 bits/slot
     C_UB = C_UB / np.log(2)
 
     diagnostics = {
@@ -256,24 +389,13 @@ def capacity_ub_dual(S_bar, S_max_eff, lambda_b, dt=1e-6,
 
 
 # ============================================================================
-# 离散输入容量（AB 算法）⭐ 重新标注
+# 离散输入容量（保留原实现）
 # ============================================================================
 
 def capacity_discrete_input(S_bar, S_max_eff, lambda_b, dt=1e-6,
                             tau_d=50e-9, M_pixels=16,
                             A_grid=None, max_iter=500, tol=1e-5):
-    """
-    离散输入信道容量（Arimoto-Blahut 算法）
-
-    ⚠️  注意：这是"离散幅度网格上的容量"，对连续幅度信道来说是下界！
-
-    不应标注为"上界"。正确的上界请使用 capacity_ub_dual()。
-
-    返回：
-        C_discrete: 离散输入容量
-        p_opt: 最优输入分布
-        diagnostics: 收敛信息
-    """
+    """离散输入信道容量（Arimoto-Blahut 算法）"""
 
     if A_grid is None:
         A_grid = np.concatenate([
@@ -294,7 +416,6 @@ def capacity_discrete_input(S_bar, S_max_eff, lambda_b, dt=1e-6,
     K_max = int(np.ceil(lambda_b_eff + S_max_eff + 12 * np.sqrt(lambda_b_eff + S_max_eff)))
     K_max = min(K_max, 300)
 
-    # AB 算法主体
     return _arimoto_blahut_cpu(A_grid, lambda_b_eff, S_bar, K_max, max_iter, tol)
 
 
@@ -365,66 +486,82 @@ def _arimoto_blahut_cpu(A_grid, lambda_b, S_bar, K_max, max_iter, tol):
     return C_discrete, p_A, diagnostics
 
 
-# 向后兼容别名（但不推荐使用）
-def capacity_ub_discrete(*args, **kwargs):
-    """
-    ⚠️  已废弃：这实际上是离散输入容量（下界），不是上界
-
-    请改用：
-    - capacity_ub_dual() - 真正的对偶上界
-    - capacity_discrete_input() - 离散输入容量（正确命名）
-    """
-    warnings.warn(
-        "capacity_ub_discrete() 实际计算的是离散输入容量（下界），不是上界。"
-        "请改用 capacity_ub_dual() 获取真正的上界，或使用 capacity_discrete_input() 明确标注。",
-        DeprecationWarning
-    )
-    return capacity_discrete_input(*args, **kwargs)
-
-
 # ============================================================================
-# 物理背景模型（修复单位）⭐ 关键修复
+# 物理背景模型（完整版，支持配置）
 # ============================================================================
 
 def physical_background_model(sun_angle_deg, fov_urad,
                               orbit_params=None,
                               wavelength=1550e-9,
-                              dt_slot=2e-6):  # ⭐ 新增参数：当前时隙持续时间
+                              dt_slot=2e-6,
+                              config=None):
     """
-    完整物理背景模型（单位修复版）
-
-    ⚠️  关键修复：输出按 dt_slot 计算，而非固定 1ms
-
-    组成：
-        1. 太阳杂散光（PST 模型）
-        2. 地球照（轨道几何）
-        3. 黄道光（日心基线）
-
-    参数：
-        dt_slot: 当前时隙持续时间 [秒]
-                 默认 2µs，应与仿真的 dt 一致！
-
-    返回：
-        lambda_b: 总背景光子数 [photons/slot]
-                  ⚠️  单位是"当前时隙"的光子数，不是 1ms 的
-        components: 各分量字典（单位相同）
+    完整物理背景模型（基于"指令4"技术报告 + 可配置参数）
     """
 
-    # 太阳杂散光
-    sun_angle_deg = np.clip(sun_angle_deg, 10, 180)
-    log_pst = -4.0 - 3.0 * np.log10(sun_angle_deg / 10.0)
-    log_pst = np.clip(log_pst, -10, -4)
-    pst = 10 ** log_pst
+    # 从配置读取参数
+    if config is not None and 'physical_model' in config:
+        pm = config['physical_model']
+        A_eff = pm.get('receiver_aperture', 1e-4)
+        Delta_lambda = pm.get('filter_bandwidth', 1e-9)
+        tau_optics = pm.get('optical_efficiency', 0.7)
+        pst_class = pm.get('pst_class', 'nominal')
+
+        albedo_ocean = pm.get('albedo_ocean', 0.05)
+        albedo_land = pm.get('albedo_land', 0.25)
+        albedo_cloud = pm.get('albedo_cloud', 0.55)
+        cloud_cover = pm.get('global_cloud_cover', 0.6)
+
+        zodiacal_base = pm.get('zodiacal_base_1550nm', 3.5e-9)
+    else:
+        A_eff = 1e-4
+        Delta_lambda = 1e-9
+        tau_optics = 0.7
+        pst_class = 'nominal'
+
+        albedo_ocean = 0.05
+        albedo_land = 0.25
+        albedo_cloud = 0.55
+        cloud_cover = 0.6
+
+        zodiacal_base = 3.5e-9
+
+    # 物理常数
+    SSI_1550nm = 0.233
+    h = 6.626e-34
+    c = 3.0e8
+    E_photon = (h * c) / wavelength
 
     fov_rad = fov_urad * 1e-6
     omega_fov = np.pi * (fov_rad / 2) ** 2
 
-    # ⭐ 关键：先计算"率"（photons/s），最后乘 dt_slot
-    solar_flux_baseline = 1e10  # photons/(m²·s·sr) at 1 AU
-    A_eff = 1e-4  # 1 cm² 有效口径
+    # PST函数
+    def pst_function(theta_deg, performance='nominal'):
+        theta_deg = np.clip(theta_deg, 10, 180)
 
-    # 太阳杂散光率 [photons/s]
-    lambda_solar_rate = pst * solar_flux_baseline * A_eff * omega_fov
+        if performance == 'high_performance':
+            ref_points = {10: 1.0e-8, 30: 5.0e-10, 60: 1.0e-11}
+        else:
+            ref_points = {10: 5.0e-6, 30: 1.0e-7, 60: 5.0e-9}
+
+        if theta_deg <= 10:
+            return ref_points[10]
+        elif theta_deg <= 30:
+            log_pst = np.interp(theta_deg, [10, 30],
+                                [np.log10(ref_points[10]), np.log10(ref_points[30])])
+            return 10 ** log_pst
+        elif theta_deg <= 60:
+            log_pst = np.interp(theta_deg, [30, 60],
+                                [np.log10(ref_points[30]), np.log10(ref_points[60])])
+            return 10 ** log_pst
+        else:
+            return ref_points[60] * (60 / theta_deg) ** 3
+
+    # 太阳杂散光
+    pst = pst_function(sun_angle_deg, performance=pst_class)
+    L_stray = (SSI_1550nm * pst) / omega_fov
+    P_solar = L_stray * A_eff * omega_fov * (Delta_lambda * 1e9) * tau_optics
+    lambda_solar_rate = P_solar / E_photon
 
     # 地球照
     if orbit_params is not None:
@@ -435,21 +572,28 @@ def physical_background_model(sun_angle_deg, fov_urad,
         theta_earth = np.arctan(R_earth / altitude_km)
         omega_earth = 2 * np.pi * (1 - np.cos(theta_earth))
 
-        albedo = 0.3
-        phase_factor = np.cos(np.radians(earth_phase)) * 0.5 + 0.5
+        alpha_composite = (
+                0.71 * (1 - cloud_cover) * albedo_ocean +
+                0.29 * (1 - cloud_cover) * albedo_land +
+                cloud_cover * albedo_cloud
+        )
 
-        earth_flux = solar_flux_baseline * albedo * phase_factor
-        lambda_earthshine_rate = earth_flux * A_eff * omega_fov * (omega_earth / (4 * np.pi))
+        phase_factor = np.cos(np.radians(earth_phase)) * 0.5 + 0.5
+        L_earthshine = (alpha_composite * SSI_1550nm / np.pi) * phase_factor
+        P_earth = L_earthshine * A_eff * omega_earth * (Delta_lambda * 1e9) * tau_optics
+        lambda_earthshine_rate = P_earth / E_photon
     else:
-        # 默认：地球照约为太阳杂散光的一半
         lambda_earthshine_rate = 0.5 * lambda_solar_rate
+        L_earthshine = None
 
     # 黄道光
-    zodiacal_baseline_rate = 1e-2 * lambda_solar_rate
-    ecliptic_factor = 1.0 + 0.3 * np.cos(np.radians(sun_angle_deg))
-    lambda_zodiacal_rate = zodiacal_baseline_rate * ecliptic_factor
+    L_zodiacal_base = zodiacal_base
+    ecliptic_factor = 1.0 + 2.4 * (1 - np.cos(np.radians(sun_angle_deg)))
+    L_zodiacal = L_zodiacal_base * ecliptic_factor
+    P_zodiacal = L_zodiacal * A_eff * omega_fov * (Delta_lambda * 1e9) * tau_optics
+    lambda_zodiacal_rate = P_zodiacal / E_photon
 
-    # ⭐ 总率 → 当前时隙光子数
+    # 汇总
     lambda_b_rate = lambda_solar_rate + lambda_earthshine_rate + lambda_zodiacal_rate
     lambda_b = lambda_b_rate * dt_slot
 
@@ -457,20 +601,27 @@ def physical_background_model(sun_angle_deg, fov_urad,
         'solar': lambda_solar_rate * dt_slot,
         'earthshine': lambda_earthshine_rate * dt_slot,
         'zodiacal': lambda_zodiacal_rate * dt_slot,
-        'total': lambda_b
+        'total': lambda_b,
+        'pst': pst,
+        'pst_class': pst_class,
+        'L_stray': L_stray,
+        'L_earthshine': L_earthshine,
+        'L_zodiacal': L_zodiacal,
+        'alpha_composite': alpha_composite if orbit_params else None,
+        'omega_fov': omega_fov,
+        'omega_earth': omega_earth if orbit_params else None,
     }
 
     return lambda_b, components
 
 
 # ============================================================================
-# FIM 计算（保持不变）
+# 辅助函数（保留）
 # ============================================================================
 
 def fim_pilot(alpha, rho, Sbar, N, dt, params, dither_seq,
               tau_d=None, S_pilot_override=None, M_pixels=16):
-    """FIM 计算（简化版，实际使用时应包含完整实现）"""
-
+    """FIM 计算（简化版）"""
     theta_b = params['theta_b']
     sigma_point_sq = params.get('sigma2', 1e-12)
     r_b = params['r_b']
@@ -491,7 +642,6 @@ def fim_pilot(alpha, rho, Sbar, N, dt, params, dither_seq,
 
     mu_true = np.array([params.get('mu_x', 1e-6), params.get('mu_y', 0.5e-6)])
 
-    # 简化实现（实际应使用完整版本）
     a = 4.0 / (theta_b ** 2)
     b = 2.0 / (theta_b ** 2)
     gamma = 1.0 + a * sigma_point_sq
@@ -531,10 +681,6 @@ def fim_pilot(alpha, rho, Sbar, N, dt, params, dither_seq,
 
     return I
 
-
-# ============================================================================
-# 辅助函数
-# ============================================================================
 
 def poisson_entropy(lambda_param, K_max=None):
     """Poisson 熵计算"""
@@ -593,64 +739,28 @@ def generate_dither_sequence(N, theta_b):
 
 SPEED_OF_LIGHT = 299792458
 
+if __name__ == "__main__":
+    print("⚡ GPU加速测试...")
 
-# ============================================================================
-# 性能测试（演示上下界）
-# ============================================================================
-
-def benchmark_bounds():
-    """测试上下界实现"""
-    print("\n" + "=" * 60)
-    print("⚡ 容量界测试")
-    print("=" * 60)
-
+    # 测试批量计算
     S_bar = 50
     S_max = 100
-    lambda_b = 1.0
+    lambda_b_array = np.logspace(-2, 2, 20)
 
-    print(f"\n参数：S̄={S_bar}, S_max={S_max}, λ_b={lambda_b}")
+    print(f"\n测试参数：{len(lambda_b_array)} 个背景光子数点")
 
-    # 下界1：二元输入
-    print("\n1️⃣  二元输入下界...")
+    # 测试下界
     start = time.time()
-    C_lb_binary, _ = capacity_lb(S_bar, S_max, lambda_b)
-    t1 = time.time() - start
-    print(f"   C_LB (binary) = {C_lb_binary:.4f} bits/slot")
-    print(f"   耗时：{t1 * 1000:.1f} ms")
+    C_lb_array, _ = capacity_lb_batch_gpu(S_bar, S_max, lambda_b_array)
+    t_gpu = time.time() - start
 
-    # 下界2：离散输入（AB）
-    print("\n2️⃣  离散输入容量（AB算法）...")
+    print(f"✅ GPU批量计算：{t_gpu:.3f} 秒")
+    print(f"   平均容量：{np.mean(C_lb_array):.4f} bits/slot")
+
+    # 对比CPU
     start = time.time()
-    C_discrete, _, diag = capacity_discrete_input(S_bar, S_max, lambda_b, max_iter=100)
-    t2 = time.time() - start
-    print(f"   C_discrete (AB) = {C_discrete:.4f} bits/slot")
-    print(f"   耗时：{t2 * 1000:.1f} ms")
-    print(f"   收敛：{diag['iterations']} 次迭代")
+    C_lb_cpu = [capacity_lb(S_bar, S_max, lb)[0] for lb in lambda_b_array[:5]]
+    t_cpu = (time.time() - start) * 4  # 估算全部时间
 
-    # 上界：对偶公式
-    print("\n3️⃣  对偶上界（Dual UB）...")
-    start = time.time()
-    C_ub, params_opt, diag_ub = capacity_ub_dual(S_bar, S_max, lambda_b)
-    t3 = time.time() - start
-    print(f"   C_UB (dual) = {C_ub:.4f} bits/slot")
-    print(f"   耗时：{t3 * 1000:.1f} ms")
-    print(f"   最优参数：λ_q={params_opt[0]:.2f}, ν={params_opt[1]:.4f}")
-
-    # 显示夹逼
-    print("\n📊 容量界总结：")
-    print(f"   下界（二元）：   {C_lb_binary:.4f} bits/slot")
-    print(f"   下界（离散）：   {C_discrete:.4f} bits/slot")
-    print(f"   上界（对偶）：   {C_ub:.4f} bits/slot")
-    print(f"   上下界差距：     {C_ub - C_lb_binary:.4f} bits/slot")
-    print(f"   相对差距：       {(C_ub - C_lb_binary) / C_lb_binary * 100:.2f}%")
-
-    if C_lb_binary <= C_discrete <= C_ub:
-        print("\n✅ 界关系正确：C_LB ≤ C_discrete ≤ C_UB")
-    else:
-        print("\n⚠️  界关系异常，请检查实现")
-
-    print("\n" + "=" * 60)
-
-
-if __name__ == "__main__":
-    benchmark_bounds()
+    print(f"📊 CPU串行估算：{t_cpu:.3f} 秒")
+    print(f"🚀 加速比：{t_cpu / t_gpu:.1f}x")

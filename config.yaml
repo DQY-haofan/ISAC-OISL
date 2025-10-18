@@ -153,6 +153,22 @@ capacity:
 # PHYSICAL BACKGROUND MODEL - Section II Integration
 # ----------------------------------------------------------------------------
 physical_model:
+  # 系统参数
+  receiver_aperture: 1.0e-4      # m², 有效口径
+  filter_bandwidth: 1.0e-9       # m, 光滤波器带宽
+  optical_efficiency: 0.7        # 光学透过率
+
+  # PST性能（选择 "nominal" 或 "high_performance"）
+  pst_class: "nominal"
+
+  # 地球反照率模型
+  albedo_ocean: 0.05
+  albedo_land: 0.25
+  albedo_cloud: 0.55
+  global_cloud_cover: 0.6
+
+  # 黄道光基准值（表4）
+  zodiacal_base_1550nm: 3.5e-9   # W·m⁻²·sr⁻¹·nm⁻¹
   # Solar stray light (PST model)
   solar:
     baseline_flux: 1.0e10         # Photons/(m²·s·sr) at 1 AU
