@@ -1347,7 +1347,7 @@ def capacity_gap_analysis(config, dirs):
     ax1 = axes[0, 0]
     S_bar_fixed = 50
 
-    if _hw_config.gpu_available:
+    if False:  # ⭐ 临时禁用GPU
         C_lb, _ = capacity_lb_batch_gpu(S_bar_fixed, S_max_eff, lambda_b_range,
                                         dt, tau_d, M_pixels)
         C_ub = capacity_ub_dual_batch_gpu(S_bar_fixed, S_max_eff, lambda_b_range,
