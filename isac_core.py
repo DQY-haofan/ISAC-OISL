@@ -94,17 +94,28 @@ _hw_config = HardwareConfig()
 
 def capacity_lb_batch_gpu(S_bar, S_max, lambda_b_array, dt=1e-6, tau_d=50e-9, M_pixels=16):
     """
-    批量计算容量下界（GPU加速优化版 - 修复数值稳定性）
+    批量计算容量下界（GPU加速）
+
+    参数：
+        S_bar: 平均功率约束
+        S_max: 峰值功率约束
+        lambda_b_array: 背景光子数数组，shape (N,)
+        dt, tau_d, M_pixels: 硬件参数
+
+    返回：
+        C_array: 容量数组，shape (N,)
+        A_opt_array: 最优幅度数组，shape (N,)
     """
+
     if not _hw_config.gpu_available:
-        # CPU后备
-        results = []
+        # 后备：逐点CPU计算
+        C_array = []
+        A_opt_array = []
         for lambda_b in lambda_b_array:
             C, A_opt = capacity_lb(S_bar, S_max, lambda_b, dt, tau_d, M_pixels)
-            results.append((C, A_opt))
-        C_array = np.array([r[0] for r in results])
-        A_opt_array = np.array([r[1] for r in results])
-        return C_array, A_opt_array
+            C_array.append(C)
+            A_opt_array.append(A_opt)
+        return np.array(C_array), np.array(A_opt_array)
 
     cp = _hw_config.cp
 
@@ -113,77 +124,66 @@ def capacity_lb_batch_gpu(S_bar, S_max, lambda_b_array, dt=1e-6, tau_d=50e-9, M_
     if tau_d > 0 and M_pixels > 0:
         S_max_eff = min(S_max, M_pixels * dt / tau_d)
 
-    lambda_b_gpu = cp.array(lambda_b_array)
+    # 转移到GPU
+    lambda_b_gpu = cp.array(lambda_b_array)  # shape (N,)
     N = len(lambda_b_array)
 
-    # A 网格（增加分辨率以充分利用GPU）
-    N_A = 200  # ⭐ 从100增加到200
-    A_vals = cp.linspace(S_bar, S_max_eff, N_A)
+    # A 网格
+    A_min = S_bar
+    A_max = S_max_eff
+    N_A = 100
+    A_vals = cp.linspace(A_min, A_max, N_A)  # shape (N_A,)
 
-    # K 网格（使用更安全的上限）
-    lambda_max = float(cp.max(lambda_b_gpu).get())
-    K_max = int(np.ceil(lambda_max + S_max_eff + 12 * np.sqrt(lambda_max + S_max_eff)))
-    K_max = min(K_max, 600)  # ⭐ 增加到600
-    k_vals = cp.arange(K_max)
+    # K 网格
+    K_max = int(cp.ceil(cp.max(lambda_b_gpu) + S_max_eff + 10 * cp.sqrt(cp.max(lambda_b_gpu) + S_max_eff)))
+    K_max = min(K_max, 500)
+    k_vals = cp.arange(K_max)  # shape (K,)
 
-    # ⭐ 预计算 gammaln 并传到GPU（避免重复计算）
-    gammaln_k_cpu = gammaln((k_vals + 1).get())
-    gammaln_k = cp.array(gammaln_k_cpu)
+    # 广播计算：lambda_b (N,1,1), A (1,N_A,1), k (1,1,K)
+    lambda_b_3d = lambda_b_gpu[:, None, None]  # (N, 1, 1)
+    A_3d = A_vals[None, :, None]  # (1, N_A, 1)
+    k_3d = k_vals[None, None, :]  # (1, 1, K)
 
-    # 广播：lambda_b (N,1,1), A (1,N_A,1), k (1,1,K)
-    lambda_b_3d = lambda_b_gpu[:, None, None]
-    A_3d = A_vals[None, :, None]
-    k_3d = k_vals[None, None, :]
-    p_vals = S_bar / A_vals
-    p_3d = p_vals[None, :, None]
+    # 计算 p = S_bar / A
+    p_vals = S_bar / A_vals  # (N_A,)
+    p_3d = p_vals[None, :, None]  # (1, N_A, 1)
 
-    # ⭐ 数值稳定性：添加小常数避免log(0)
-    eps = 1e-30
+    # 过滤 p > 1 的情况
+    valid_mask = (p_3d <= 1.0)  # (1, N_A, 1)
 
-    # P(k|X=0): lambda_b only
-    log_P0 = -lambda_b_3d + k_3d * cp.log(lambda_b_3d + eps) - gammaln_k[None, None, :]
-    # ⭐ 使用 logsumexp 技巧归一化（数值稳定）
-    log_P0_max = cp.max(log_P0, axis=2, keepdims=True)
-    P0 = cp.exp(log_P0 - log_P0_max)
-    P0 = P0 / (cp.sum(P0, axis=2, keepdims=True) + eps)
+    # P(k | X=0): lambda_b only
+    log_P0 = -lambda_b_3d + k_3d * cp.log(lambda_b_3d + 1e-20) - cp.array(gammaln(k_3d.get() + 1))
+    P0 = cp.exp(log_P0)
+    P0 = P0 / (cp.sum(P0, axis=2, keepdims=True) + 1e-20)  # (N, 1, K)
 
-    # P(k|X=A): lambda_b + A
-    lambda_total = lambda_b_3d + A_3d
-    log_PA = -lambda_total + k_3d * cp.log(lambda_total + eps) - gammaln_k[None, None, :]
-    log_PA_max = cp.max(log_PA, axis=2, keepdims=True)
-    PA = cp.exp(log_PA - log_PA_max)
-    PA = PA / (cp.sum(PA, axis=2, keepdims=True) + eps)
+    # P(k | X=A): lambda_b + A
+    lambda_total = lambda_b_3d + A_3d  # (N, N_A, 1)
+    log_PA = -lambda_total + k_3d * cp.log(lambda_total + 1e-20) - cp.array(gammaln(k_3d.get() + 1))
+    PA = cp.exp(log_PA)
+    PA = PA / (cp.sum(PA, axis=2, keepdims=True) + 1e-20)  # (N, N_A, K)
 
     # P(Y): (1-p)*P0 + p*PA
-    PY = (1 - p_3d) * P0 + p_3d * PA
-    PY = PY / (cp.sum(PY, axis=2, keepdims=True) + eps)
+    PY = (1 - p_3d) * P0 + p_3d * PA  # (N, N_A, K)
+    PY = PY / (cp.sum(PY, axis=2, keepdims=True) + 1e-20)
 
-    # 互信息（数值稳定版本）
+    # 互信息：H(Y) - (1-p)*H(Y|X=0) - p*H(Y|X=A)
     log2 = cp.log(2)
 
-    # H(Y) = -sum(P * log(P))
-    H_Y = -cp.sum(cp.where(PY > eps, PY * cp.log(PY + eps) / log2, 0), axis=2)
+    H_Y = -cp.sum(cp.where(PY > 1e-20, PY * cp.log(PY) / log2, 0), axis=2)  # (N, N_A)
+    H_Y0 = -cp.sum(cp.where(P0 > 1e-20, P0 * cp.log(P0) / log2, 0), axis=2)  # (N, 1)
+    H_YA = -cp.sum(cp.where(PA > 1e-20, PA * cp.log(PA) / log2, 0), axis=2)  # (N, N_A)
 
-    # H(Y|X=0)
-    H_Y0 = -cp.sum(cp.where(P0 > eps, P0 * cp.log(P0 + eps) / log2, 0), axis=2)
+    I = H_Y - (1 - p_vals[None, :]) * H_Y0 - p_vals[None, :] * H_YA  # (N, N_A)
 
-    # H(Y|X=A)
-    H_YA = -cp.sum(cp.where(PA > eps, PA * cp.log(PA + eps) / log2, 0), axis=2)
-
-    # I(X;Y) = H(Y) - (1-p)*H(Y|X=0) - p*H(Y|X=A)
-    I = H_Y - (1 - p_vals[None, :]) * H_Y0 - p_vals[None, :] * H_YA
-
-    # 过滤 p > 1 的无效点
-    I = cp.where(p_vals[None, :] <= 1.0, I, -cp.inf)
+    # 应用 valid_mask
+    I = cp.where(valid_mask[:, :, 0], I, -cp.inf)
 
     # 找到每个 lambda_b 的最优 A
-    I_max_idx = cp.argmax(I, axis=1)
-    C_array = cp.max(I, axis=1)
-
-    # ⭐ 使用高级索引避免循环
+    I_max_idx = cp.argmax(I, axis=1)  # (N,)
+    C_array = cp.max(I, axis=1)  # (N,)
     A_opt_array = A_vals[I_max_idx]
 
-    # ⭐ 批量传回CPU（一次性传输）
+    # 转回CPU
     return cp.asnumpy(C_array), cp.asnumpy(A_opt_array)
 
 
