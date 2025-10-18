@@ -39,9 +39,11 @@ from main_simulation import (
 )
 
 from isac_core import (
-    capacity_lb,              # 二元输入下界
-    capacity_ub_dual,         # ⭐ 对偶上界（修复）
-    capacity_discrete_input,  # 离散输入容量（原AB算法）
+    capacity_lb,                    # 二元输入下界
+    capacity_lb_batch_gpu,          # ⭐ GPU批量下界
+    capacity_ub_dual,               # 对偶上界（单点）
+    capacity_ub_dual_batch_gpu,     # ⭐ GPU批量上界
+    capacity_discrete_input,        # 离散输入容量（原AB算法）
     physical_background_model,
     fim_pilot,
     poisson_entropy,
@@ -49,7 +51,6 @@ from isac_core import (
     generate_dither_sequence,
     SPEED_OF_LIGHT
 )
-
 
 warnings.filterwarnings('ignore')
 
