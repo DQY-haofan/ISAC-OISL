@@ -1,0 +1,284 @@
+{
+  "timestamp": "2025-10-18T16:48:11.087471",
+  "seed": 42,
+  "python_version": "3.13.5 (tags/v3.13.5:6cb20a2, Jun 11 2025, 16:15:46) [MSC v.1943 64 bit (AMD64)]",
+  "numpy_version": "2.3.3",
+  "config": {
+    "system_parameters": {
+      "Sbar": 50.0,
+      "Smax": 100.0,
+      "dt": 1e-06,
+      "N": 10000,
+      "theta_b": 1e-05,
+      "wavelength": 1.55e-06,
+      "mu_x": 1e-06,
+      "mu_y": 5e-07,
+      "sigma2": 1e-12,
+      "r_b": 1.0,
+      "M_pixels": 16,
+      "tau_d": 5e-08,
+      "quantum_efficiency": 0.5,
+      "J_P": [
+        [
+          "1.0e12",
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          "1.0e12",
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          "1.0e6",
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          0.001
+        ]
+      ]
+    },
+    "hardware_platforms": {
+      "short_dead_time": {
+        "name": "Advanced Si-SPAD (Short \u03c4_d)",
+        "dead_time": 3e-08,
+        "parallel_pixels": 16,
+        "peak_power": 100.0,
+        "slot_duration": 1e-06,
+        "description": "State-of-the-art silicon SPAD with fast quenching"
+      },
+      "long_dead_time": {
+        "name": "InGaAs APD (Long \u03c4_d)",
+        "dead_time": 1e-07,
+        "parallel_pixels": 4,
+        "peak_power": 100.0,
+        "slot_duration": 1e-06,
+        "description": "High-sensitivity InGaAs avalanche photodiode"
+      },
+      "multi_pixel_array": {
+        "name": "Massively Parallel SPAD Array",
+        "dead_time": 5e-08,
+        "parallel_pixels": 64,
+        "peak_power": 100.0,
+        "slot_duration": 1e-06,
+        "description": "Large-format array for high throughput"
+      }
+    },
+    "simulation": {
+      "signal_budgets": [
+        0.5,
+        2,
+        10,
+        50
+      ],
+      "background_regimes": {
+        "zodiacal": {
+          "lambda_b": 0.01,
+          "color": "#3498db"
+        },
+        "earthshine": {
+          "lambda_b": 1.0,
+          "color": "#f39c12"
+        },
+        "stray_light": {
+          "lambda_b": 10.0,
+          "color": "#e74c3c"
+        }
+      },
+      "alpha_range": [
+        0.05,
+        0.95,
+        20
+      ],
+      "rho_range": [
+        0.05,
+        0.95,
+        20
+      ],
+      "mse_targets_log": [
+        -12,
+        -6,
+        15
+      ]
+    },
+    "monte_carlo": {
+      "n_trials": 10000,
+      "confidence_level": 0.95,
+      "validation_scenarios": [
+        {
+          "name": "Low Background",
+          "Sbar": 10,
+          "r_b": 0.1,
+          "alpha": 0.3,
+          "rho": 0.5
+        },
+        {
+          "name": "Medium Background",
+          "Sbar": 50,
+          "r_b": 1.0,
+          "alpha": 0.2,
+          "rho": 0.6
+        },
+        {
+          "name": "High Background",
+          "Sbar": 20,
+          "r_b": 5.0,
+          "alpha": 0.4,
+          "rho": 0.7
+        }
+      ],
+      "mle_optimizer": {
+        "method": "Nelder-Mead",
+        "max_iterations": 200,
+        "tolerance": 1e-08
+      }
+    },
+    "capacity": {
+      "binary_input": {
+        "amplitude_grid_points": 100
+      },
+      "arimoto_blahut": {
+        "amplitude_grid_points": 50,
+        "max_iterations": 1000,
+        "convergence_tolerance": 1e-06
+      },
+      "poisson_truncation": {
+        "tail_probability": 1e-10
+      }
+    },
+    "physical_model": {
+      "receiver_aperture": 0.0001,
+      "filter_bandwidth": 1e-09,
+      "optical_efficiency": 0.7,
+      "pst_class": "nominal",
+      "albedo_ocean": 0.05,
+      "albedo_land": 0.25,
+      "albedo_cloud": 0.55,
+      "global_cloud_cover": 0.6,
+      "zodiacal_base_1550nm": 3.5e-09,
+      "solar": {
+        "baseline_flux": "1.0e10",
+        "pst_min_angle": 10.0,
+        "pst_exponent": 3.0
+      },
+      "earthshine": {
+        "earth_radius_km": 6371,
+        "average_albedo": 0.3,
+        "phase_modulation": true
+      },
+      "zodiacal": {
+        "ecliptic_baseline": 0.01,
+        "heliocentric_variation": 0.3
+      },
+      "orbit": {
+        "altitude_km": 600,
+        "earth_phase_angle_deg": 90
+      }
+    },
+    "ablation": {
+      "dither_amplitude": {
+        "range": [
+          0.1,
+          2.0,
+          20
+        ],
+        "baseline": 0.5
+      },
+      "dead_time": {
+        "range": [
+          1e-08,
+          2e-07,
+          20
+        ],
+        "baseline": 5e-08
+      },
+      "pointing_variance": {
+        "range": [
+          -13,
+          -10,
+          20
+        ],
+        "baseline": -12
+      },
+      "background_rate": {
+        "range": [
+          -2,
+          1,
+          20
+        ],
+        "baseline": 0
+      }
+    },
+    "figures": {
+      "style": "ieee",
+      "dpi": 300,
+      "format": [
+        "pdf",
+        "png"
+      ],
+      "colors": {
+        "zodiacal": "#3498db",
+        "earthshine": "#f39c12",
+        "stray_light": "#e74c3c",
+        "lower_bound": "#2ecc71",
+        "upper_bound": "#e67e22"
+      },
+      "fonts": {
+        "title": 13,
+        "axis_label": 12,
+        "tick_label": 10,
+        "legend": 9,
+        "annotation": 8
+      }
+    },
+    "computation": {
+      "use_multiprocessing": true,
+      "num_workers": null,
+      "max_grid_size": 50,
+      "chunk_size": 100,
+      "epsilon": 1e-20,
+      "condition_number_threshold": "1.0e30"
+    },
+    "output": {
+      "base_directory": "section_iv_results",
+      "subdirectories": {
+        "figures": "figures",
+        "appendix": "appendix",
+        "analysis": "analysis",
+        "data": "data",
+        "validation": "validation"
+      },
+      "figure_prefix": "Fig_",
+      "appendix_prefix": "Fig_A",
+      "data_prefix": "data_",
+      "log_level": "INFO",
+      "log_file": "simulation.log"
+    },
+    "reproducibility": {
+      "random_seed": 42,
+      "version_info": true,
+      "git_commit": true,
+      "metadata": {
+        "paper_title": "Fundamental Performance Limits of OISL-ISAC Systems",
+        "authors": [
+          "Author Names"
+        ],
+        "institution": "Your Institution",
+        "contact": "email@example.com",
+        "date_generated": "auto"
+      }
+    }
+  },
+  "command_line": "F:\\Github-repositories\\ISAC-OISL\\run_section_iv.py",
+  "hardware": {
+    "numba_available": true,
+    "gpu_available": false
+  }
+}

@@ -304,26 +304,52 @@ def capacity_lb(S_bar, S_max, lambda_b, dt=1e-6, tau_d=50e-9, M_pixels=16):
 
 
 def _mutual_information_binary_cpu(A, p, lambda_b, K_max):
-    """二元输入互信息（CPU版本）"""
+    """
+    二元输入互信息（修复版）
+
+    ⭐ 修复点：正确处理0概率的熵计算
+    """
     k_vals = np.arange(K_max)
 
+    # P(Y|X=0): Poisson(lambda_b)
     log_P0 = -lambda_b + k_vals * np.log(lambda_b + 1e-20) - gammaln(k_vals + 1)
     P0 = np.exp(log_P0)
     P0 = P0 / (np.sum(P0) + 1e-20)
 
+    # P(Y|X=A): Poisson(lambda_b + A)
     log_PA = -(lambda_b + A) + k_vals * np.log(lambda_b + A + 1e-20) - gammaln(k_vals + 1)
     PA = np.exp(log_PA)
     PA = PA / (np.sum(PA) + 1e-20)
 
+    # P(Y) = (1-p)*P0 + p*PA
     PY = (1 - p) * P0 + p * PA
     PY = PY / (np.sum(PY) + 1e-20)
 
     log2 = np.log(2)
-    H_Y = -np.sum(np.where(PY > 1e-20, PY * np.log(PY) / log2, 0))
-    H_Y0 = -np.sum(np.where(P0 > 1e-20, P0 * np.log(P0) / log2, 0))
-    H_YA = -np.sum(np.where(PA > 1e-20, PA * np.log(PA) / log2, 0))
 
-    return H_Y - (1 - p) * H_Y0 - p * H_YA
+    # ⭐⭐⭐ 修复：使用显式循环避免np.where的陷阱
+    H_Y = 0.0
+    for k in range(K_max):
+        if PY[k] > 1e-20:  # ✅ 先判断，再计算log
+            H_Y -= PY[k] * np.log(PY[k]) / log2
+
+    H_Y0 = 0.0
+    for k in range(K_max):
+        if P0[k] > 1e-20:
+            H_Y0 -= P0[k] * np.log(P0[k]) / log2
+
+    H_YA = 0.0
+    for k in range(K_max):
+        if PA[k] > 1e-20:
+            H_YA -= PA[k] * np.log(PA[k]) / log2
+
+    # 互信息
+    I = H_Y - (1 - p) * H_Y0 - p * H_YA
+
+    # ⭐ 安全检查：确保非负
+    I = max(I, 0.0)
+
+    return I
 
 
 def capacity_ub_dual(S_bar, S_max_eff, lambda_b, dt=1e-6,
