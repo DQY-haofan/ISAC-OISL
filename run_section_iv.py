@@ -95,7 +95,7 @@ def set_reproducibility(seed=42):
 
 def generate_figure_1_enhanced(config, dirs):
     """
-    生成 Fig_1_Capacity_Bounds_Fixed.pdf（大批量GPU加速版）
+    生成 Fig_1_Capacity_Bounds_Fixed.pdf（GPU加速版）
     """
     print("\n" + "=" * 60)
     print("📊 FIGURE 1: 容量界对比（GPU加速版）")
@@ -103,8 +103,8 @@ def generate_figure_1_enhanced(config, dirs):
 
     colors = setup_ieee_style()
 
-    # ⭐ 增加采样点（GPU喜欢大批量）
-    lambda_b_range = np.logspace(-2, 2, 200)  # 40 → 200
+    # 参数
+    lambda_b_range = np.logspace(-2, 2, 40)
     signal_budgets = config['simulation']['signal_budgets']
     hardware_config = config['hardware_platforms']['short_dead_time']
 
@@ -112,6 +112,7 @@ def generate_figure_1_enhanced(config, dirs):
     M_pixels = hardware_config['parallel_pixels']
     dt = hardware_config['slot_duration']
 
+    # 有效峰值功率
     if tau_d > 0:
         S_max_eff = min(hardware_config['peak_power'],
                         (dt / tau_d) * M_pixels)
@@ -127,17 +128,33 @@ def generate_figure_1_enhanced(config, dirs):
         print(f"\n  📈 S̄ = {S_bar} photons/slot")
         start_time = time.time()
 
-        # ⭐ 一次性批量计算所有点
+        # ⭐ GPU 批量计算
         print(f"    🚀 GPU批量计算 {len(lambda_b_range)} 个点...")
 
+        # 下界：批量计算
         capacities_lb, _ = capacity_lb_batch_gpu(
             S_bar, S_max_eff, lambda_b_range, dt, tau_d, M_pixels
         )
 
-        # 上界：使用近似（避免慢速2D搜索）
+        # 上界：批量计算
         capacities_ub = capacity_ub_dual_batch_gpu(
             S_bar, S_max_eff, lambda_b_range, dt, tau_d, M_pixels
         )
+
+        # 离散输入容量（稀疏采样）
+        capacities_discrete = []
+        lambda_b_discrete = []
+        for i in range(0, len(lambda_b_range), 5):
+            lambda_b = lambda_b_range[i]
+            try:
+                C_disc, _, _ = capacity_discrete_input(
+                    S_bar, S_max_eff, lambda_b, dt, tau_d, M_pixels,
+                    max_iter=100
+                )
+                capacities_discrete.append(C_disc)
+                lambda_b_discrete.append(lambda_b)
+            except:
+                pass
 
         elapsed = time.time() - start_time
         print(f"    ✅ 完成，耗时 {elapsed:.2f} 秒")
@@ -147,18 +164,18 @@ def generate_figure_1_enhanced(config, dirs):
         valid_gaps = gaps[(gaps > 0) & (gaps < 1)]
         avg_gap = np.mean(valid_gaps) if len(valid_gaps) > 0 else 0
 
-        # 绘图（采样显示，避免图像过密）
-        plot_indices = np.linspace(0, len(lambda_b_range) - 1, 80, dtype=int)
+        # 绘图
+        ax.semilogx(lambda_b_range, capacities_lb, 'b-', linewidth=2.5,
+                    label='Lower Bound (Binary Input)')
 
-        ax.semilogx(lambda_b_range[plot_indices], capacities_lb[plot_indices],
-                    'b-', linewidth=2.5, label='Lower Bound (Binary Input)')
+        ax.semilogx(lambda_b_range, capacities_ub, 'r--', linewidth=2,
+                    label='Upper Bound (Dual Formula)')
 
-        ax.semilogx(lambda_b_range[plot_indices], capacities_ub[plot_indices],
-                    'r--', linewidth=2, label='Upper Bound (Dual Formula)')
+        if capacities_discrete:
+            ax.semilogx(lambda_b_discrete, capacities_discrete, 'g.', markersize=8,
+                        label='Discrete-input capacity (AB)')
 
-        ax.fill_between(lambda_b_range[plot_indices],
-                        capacities_lb[plot_indices],
-                        capacities_ub[plot_indices],
+        ax.fill_between(lambda_b_range, capacities_lb, capacities_ub,
                         alpha=0.2, color='gray', label='Achievability Gap')
 
         # 背景制度标记
@@ -180,13 +197,14 @@ def generate_figure_1_enhanced(config, dirs):
 
     plt.tight_layout()
 
+    # 保存
     output_path = f"{dirs['figures']}/Fig_1_Capacity_Bounds_Fixed"
     plt.savefig(f"{output_path}.pdf", dpi=300, bbox_inches='tight')
     plt.savefig(f"{output_path}.png", dpi=300, bbox_inches='tight')
     plt.close()
 
     print(f"\n✅ 保存：{output_path}.pdf")
-    
+
 # ============================================================================
 # ENHANCED FIGURE 4: PHYSICAL BACKGROUND MODEL
 # ============================================================================
