@@ -96,6 +96,8 @@ def capacity_lb_batch_gpu(S_bar, S_max, lambda_b_array, dt=1e-6, tau_d=50e-9, M_
     """
     批量计算容量下界（GPU加速）
 
+    ⭐ 修复版本：安全的熵计算，避免log(0)
+
     参数：
         S_bar: 平均功率约束
         S_max: 峰值功率约束
@@ -166,31 +168,30 @@ def capacity_lb_batch_gpu(S_bar, S_max, lambda_b_array, dt=1e-6, tau_d=50e-9, M_
     PY = (1 - p_3d) * P0 + p_3d * PA  # (N, N_A, K)
     PY = PY / (cp.sum(PY, axis=2, keepdims=True) + 1e-20)
 
-    # 互信息：H(Y) - (1-p)*H(Y|X=0) - p*H(Y|X=A)
+    # ⭐⭐⭐ 修复：安全的熵计算 ⭐⭐⭐
     log2 = cp.log(2)
 
-    # ✅ 替换为（修复版 - 更安全）
-    log2 = cp.log(2)
-
-    # 关键：先clamp概率到安全范围，避免log(0)
+    # 方法：先把概率clamp到安全范围，避免log(0)
     PY_safe = cp.clip(PY, 1e-30, 1.0)  # 把0替换为极小值
     P0_safe = cp.clip(P0, 1e-30, 1.0)
     PA_safe = cp.clip(PA, 1e-30, 1.0)
 
-    # 计算log（现在安全了）
+    # 计算log（现在不会出现log(0)了）
     log_PY = cp.log(PY_safe) / log2
     log_P0 = cp.log(P0_safe) / log2
     log_PA = cp.log(PA_safe) / log2
 
-    # 计算熵，用mask排除真正为0的项
+    # 用mask确保只对非零概率计算
     mask_Y = (PY > 1e-20)
     mask_0 = (P0 > 1e-20)
     mask_A = (PA > 1e-20)
 
-    H_Y = -cp.sum(cp.where(mask_Y, PY * log_PY, 0), axis=2)
-    H_Y0 = -cp.sum(cp.where(mask_0, P0 * log_P0, 0), axis=2)
-    H_YA = -cp.sum(cp.where(mask_A, PA * log_PA, 0), axis=2)
+    # 计算熵
+    H_Y = -cp.sum(cp.where(mask_Y, PY * log_PY, 0), axis=2)  # (N, N_A)
+    H_Y0 = -cp.sum(cp.where(mask_0, P0 * log_P0, 0), axis=2)  # (N, 1)
+    H_YA = -cp.sum(cp.where(mask_A, PA * log_PA, 0), axis=2)  # (N, N_A)
 
+    # 互信息：I = H(Y) - (1-p)*H(Y|X=0) - p*H(Y|X=A)
     I = H_Y - (1 - p_vals[None, :]) * H_Y0 - p_vals[None, :] * H_YA  # (N, N_A)
 
     # 应用 valid_mask
@@ -201,9 +202,11 @@ def capacity_lb_batch_gpu(S_bar, S_max, lambda_b_array, dt=1e-6, tau_d=50e-9, M_
     C_array = cp.max(I, axis=1)  # (N,)
     A_opt_array = A_vals[I_max_idx]
 
+    # ⭐ 安全检查：确保非负
+    C_array = cp.maximum(C_array, 0.0)
+
     # 转回CPU
     return cp.asnumpy(C_array), cp.asnumpy(A_opt_array)
-
 
 # ============================================================================
 # GPU 批量计算：对偶上界（⭐ 新增）
@@ -212,6 +215,8 @@ def capacity_lb_batch_gpu(S_bar, S_max, lambda_b_array, dt=1e-6, tau_d=50e-9, M_
 def capacity_ub_dual_batch_gpu(S_bar, S_max, lambda_b_array, dt=1e-6, tau_d=50e-9, M_pixels=16):
     """
     批量计算对偶上界（GPU加速）
+
+    ⭐ 修复版本：安全的KL散度计算
 
     返回：
         C_UB_array: shape (N,)
@@ -246,7 +251,7 @@ def capacity_ub_dual_batch_gpu(S_bar, S_max, lambda_b_array, dt=1e-6, tau_d=50e-
 
     C_UB_array = cp.full(N, cp.inf)
 
-    # 对每个 lambda_b 进行 2D 搜索（仍需循环，但内部向量化）
+    # 对每个 lambda_b 进行 2D 搜索
     for i in range(N):
         lambda_b_i = lambda_b_gpu[i]
         C_UB_min = cp.inf
@@ -256,6 +261,9 @@ def capacity_ub_dual_batch_gpu(S_bar, S_max, lambda_b_array, dt=1e-6, tau_d=50e-
             log_Q = -lambda_q + k_vals * cp.log(lambda_q + 1e-20) - cp.array(gammaln(k_vals.get() + 1))
             Q = cp.exp(log_Q)
             Q = Q / (cp.sum(Q) + 1e-20)
+
+            # ⭐ 安全clamp
+            Q_safe = cp.clip(Q, 1e-30, 1.0)
 
             for nu in nu_range:
                 # 内层：对所有 A 向量化计算
@@ -267,9 +275,19 @@ def capacity_ub_dual_batch_gpu(S_bar, S_max, lambda_b_array, dt=1e-6, tau_d=50e-
                 P = cp.exp(log_P)
                 P = P / (cp.sum(P, axis=1, keepdims=True) + 1e-20)  # (50, K)
 
+                # ⭐ 安全clamp
+                P_safe = cp.clip(P, 1e-30, 1.0)
+
+                # ⭐⭐⭐ 修复：安全的KL散度计算 ⭐⭐⭐
                 # KL(P || Q) for all A
-                kl_div = cp.sum(cp.where((P > 1e-20) & (Q[None, :] > 1e-20),
-                                         P * cp.log(P / Q[None, :]), 0), axis=1)  # (50,)
+                # 先分别计算log
+                log_P_vals = cp.log(P_safe)
+                log_Q_vals = cp.log(Q_safe)[None, :]  # broadcast
+
+                # 用mask确保只对有效概率计算
+                mask = (P > 1e-20) & (Q[None, :] > 1e-20)
+
+                kl_div = cp.sum(cp.where(mask, P * (log_P_vals - log_Q_vals), 0), axis=1)  # (50,)
 
                 # max_A [KL - nu*A]
                 obj_vals = kl_div - nu * A_search
@@ -282,6 +300,9 @@ def capacity_ub_dual_batch_gpu(S_bar, S_max, lambda_b_array, dt=1e-6, tau_d=50e-
                     C_UB_min = dual_obj
 
         C_UB_array[i] = C_UB_min / cp.log(2)
+
+    # ⭐ 安全检查：确保非负
+    C_UB_array = cp.maximum(C_UB_array, 0.0)
 
     return cp.asnumpy(C_UB_array)
 
